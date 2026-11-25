@@ -1,8 +1,8 @@
-From 61bafaea2e4a9470779eaed225ee020c34af98f3 Mon Sep 17 00:00:00 2001
-From: Proxmox-390 kernel work <devnull@localhost>
+From b803b9118f25007dad340cb55c35c6b2c6d772d7 Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
 Date: Wed, 25 Nov 2026 12:40:11 +0100
-Subject: [PATCH 01/10] KVM: s390: vsie: Rewind the PSW of ESA mode guests in
- the right format
+Subject: [PATCH 1/2] KVM: s390: vsie: Rewind the PSW of ESA mode guests in the
+ right format
 
 A state description without the z/Architecture flag holds the eight-byte
 ESA/390 PSW in the first doubleword of its PSW field: the addressing mode

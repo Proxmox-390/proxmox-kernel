@@ -1,8 +1,8 @@
-From c0739060b7dc2b2ad5dfc5942635d49fc98c9ff8 Mon Sep 17 00:00:00 2001
-From: Proxmox-390 kernel work <devnull@localhost>
+From 50263ec9c23fd31def555cbb4d3336d6d1138dc0 Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
 Date: Wed, 25 Nov 2026 12:40:11 +0100
-Subject: [PATCH 02/10] KVM: s390: selftests: Add a test for nested guests in
- ESA mode
+Subject: [PATCH 2/2] KVM: s390: selftests: Add a test for nested guests in ESA
+ mode
 
 Run a nested guest from a state description without the z/Architecture
 flag, with KVM_CAP_S390_VSIE_ESAMODE enabled, and let it execute STORE
@@ -23,8 +23,8 @@ model.
 Assisted-by: Claude:claude-fable-5-2
 ---
  tools/testing/selftests/kvm/Makefile.kvm      |   1 +
- .../selftests/kvm/s390/vsie_esa_test.c        | 174 ++++++++++++++++++
- 2 files changed, 175 insertions(+)
+ .../selftests/kvm/s390/vsie_esa_test.c        | 181 ++++++++++++++++++
+ 2 files changed, 182 insertions(+)
  create mode 100644 tools/testing/selftests/kvm/s390/vsie_esa_test.c
 
 diff --git a/tools/testing/selftests/kvm/Makefile.kvm b/tools/testing/selftests/kvm/Makefile.kvm
@@ -41,10 +41,10 @@ index f43549a56f0b..a3a0c1f90aec 100644
  TEST_GEN_PROGS_s390 += mmu_stress_test
 diff --git a/tools/testing/selftests/kvm/s390/vsie_esa_test.c b/tools/testing/selftests/kvm/s390/vsie_esa_test.c
 new file mode 100644
-index 000000000000..9b2c4b953bfd
+index 000000000000..e965ceadb34f
 --- /dev/null
 +++ b/tools/testing/selftests/kvm/s390/vsie_esa_test.c
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,181 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Test nested guests that run in ESA mode (KVM_CAP_S390_VSIE_ESAMODE).
@@ -199,6 +199,13 @@ index 000000000000..9b2c4b953bfd
 +
 +	vcpu_run(vcpu);
 +	TEST_ASSERT_EQ(get_ucall(vcpu, &uc), UCALL_SYNC);
++	/*
++	 * The capability does not tell whether the machine (or the hypervisor
++	 * this host is a guest of) runs a state description without the
++	 * z/Architecture flag. If not, it answers with validity 0x0001.
++	 */
++	if (scb->icptcode == ICPT_VALIDITY && (scb->ipb >> 16) == 0x0001)
++		ksft_exit_skip("the host cannot run nested guests in ESA mode (validity 0x0001)\n");
 +	TEST_ASSERT(scb->icptcode == ICPT_INST && scb->ipa == 0x8300,
 +		    "guest 3: icptcode 0x%02x ipa 0x%04x ipb 0x%08x psw 0x%016llx 0x%016llx",
 +		    scb->icptcode, scb->ipa, scb->ipb, scb->psw_mask, scb->psw_addr);
