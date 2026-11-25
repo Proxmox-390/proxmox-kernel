@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
+Date: Wed, 25 Nov 2026 12:47:00 +0000
+Subject: [PATCH] s390x: build with a fixed build user and host name
+
+The kernel puts the account and the machine it was built on into its
+version banner. Set KBUILD_BUILD_USER and KBUILD_BUILD_HOST for s390x
+builds, so that the packages do not depend on where they were built.
+The time stamp already comes from the changelog.
+---
+ debian/rules.d/s390x.mk | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/debian/rules.d/s390x.mk b/debian/rules.d/s390x.mk
+index 62594a76546f..ea19aec545a8 100644
+--- a/debian/rules.d/s390x.mk
++++ b/debian/rules.d/s390x.mk
+@@ -9,3 +9,7 @@ GRUB_RECOMMENDS     = s390-tools
+ FIRMWARE_DEPENDS    =
+ # the Rust toolchain is not a build dependency on this architecture
+ NEED_RUST           = no
++# the kernel records who built it where (version banner, /proc/version): use
++# a fixed identity instead of the build account and machine name
++export KBUILD_BUILD_USER := build
++export KBUILD_BUILD_HOST := proxmox-390

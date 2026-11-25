@@ -66,6 +66,12 @@ and `debian/source-upstream`; regenerate `debian/control`. The packages name bot
 `/usr/share/doc/<package>/SOURCE`. Builds from a tree with uncommitted changes are refused unless
 `ALLOW_DIRTY=1` is set; the recorded commit then ends in `-dirty`.
 
+The kernel is built with a fixed build user and host name (`build@proxmox-390`, set in
+`debian/rules.d/s390x.mk`) and the changelog date as time stamp.
+`scripts/check-packages.sh <directory with the .deb files> <source tree>` looks for the build
+account, machine name and home directory in the files, module information and version banner
+of the result; run it before packages leave the build machine.
+
 Every build that is installed anywhere needs its own version: the Debian revision is part of the
 kernel release name and of the package names, and modules are signed with a key that only exists
 during the build.

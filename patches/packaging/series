@@ -1,3 +1,4 @@
 0001-d-rules-d-control-make-firmware-dependency-signing-t.patch
 0002-add-s390x-IBM-Z-as-supported-architecture.patch
 0003-d-rules-d-control-name-the-s390x-packaging-repositor.patch
+0004-s390x-build-with-a-fixed-build-user-and-host-name.patch

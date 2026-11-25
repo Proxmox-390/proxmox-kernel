@@ -4,6 +4,8 @@ proxmox-kernel-7.3 (7.3.6-1+s390x2) trixie; urgency=medium
     right format, so that an instruction vsie wants repeated (for
     example the first STORE FACILITY LIST EXTENDED after entry into SIE)
     is no longer skipped; with a selftest.
+  * build with a fixed build user and host name: the version banner of
+    7.3.6-1+s390x1 named the account and machine it was built on.
 
  -- Yvan Janssens <yvanj@cyber.gent>  Wed, 25 Nov 2026 12:39:04 +0000
 
