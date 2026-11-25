@@ -3,7 +3,8 @@
 #
 # Looks for traces of the build environment in the built packages:
 #   - the build account, the build machine's name and the home directory
-#   - the expressions of CHECK_DENY_FILE (extended regular expressions, one per line), if set
+#   - the expressions of CHECK_DENY_FILE (extended regular expressions, one per line), if set;
+#     CHECK_ALLOW_FILE lists fixed strings that excuse a matching line
 # in every file of every package (as text and as strings of binaries), in the modinfo fields and
 # the .comment section of every module, in the generated compile.h of the headers package and in
 # the kernel's version banner. The banner is taken from the uncompressed vmlinux of the source
@@ -40,16 +41,24 @@ for deb in "$dir"/*.deb; do
 done
 
 echo "== files (text and binary strings)"
-hits=$(grep -r -l -a -E -f "$pat" "$work/x" 2>/dev/null || true)
-if [ -n "$hits" ]; then
-    echo "$hits" | sed "s#^$work/x/##" | head -n 40
-    for f in $(echo "$hits" | head -n 5); do
-        strings -a "$f" | grep -E -f "$pat" | head -n 3 | sed 's/^/    /'
-    done
-    note "build environment names found in the files above"
-else
-    echo "none"
-fi
+# CHECK_ALLOW_FILE: fixed strings; a matching line that contains one of them is not reported
+# (text of the upstream sources that happens to match an expression)
+allow=$work/allow
+: > "$allow"
+[ -z "${CHECK_ALLOW_FILE:-}" ] || cat "$CHECK_ALLOW_FILE" > "$allow"
+found=0
+while read -r f; do
+    if [ -s "$allow" ]; then
+        lines=$(strings -a "$f" | grep -E -f "$pat" | grep -v -F -f "$allow" || true)
+    else
+        lines=$(strings -a "$f" | grep -E -f "$pat" || true)
+    fi
+    [ -n "$lines" ] || continue
+    found=$((found + 1))
+    echo "${f#"$work/x/"}"
+    echo "$lines" | sed -n '1,3s/^/    /p'
+done < <(grep -r -l -a -E -f "$pat" "$work/x" 2>/dev/null || true)
+if [ "$found" -gt 0 ]; then note "build environment names found in $found file(s)"; else echo "none"; fi
 
 echo "== modules: modinfo fields and .comment"
 n=0; bad=0
@@ -61,7 +70,7 @@ while read -r ko; do
 done < <(find "$work/x" -name '*.ko' | sort)
 echo "$n modules checked, $bad with hits"
 [ "$bad" -eq 0 ] || note "build environment names in module information"
-find "$work/x" -name '*.ko' | sort | head -n 2000 | xargs -r -n 200 modinfo -F vermagic | sort | uniq -c
+find "$work/x" -name '*.ko' | sort | xargs -r -n 200 modinfo -F vermagic | sort | uniq -c
 
 echo "== compile.h of the headers package"
 ch=$(find "$work/x" -path '*/include/generated/compile.h' | head -n1)
@@ -74,7 +83,7 @@ fi
 
 echo "== version banner"
 if [ -n "$src" ] && [ -f "$src/vmlinux" ]; then
-    banner=$(strings -a "$src/vmlinux" | grep -m1 '^Linux version [0-9]')
+    banner=$(strings -a "$src/vmlinux" | awk '/^Linux version [0-9]/ && !n++ { print }')
     echo "$banner"
     echo "$banner" | grep -q -E "$ident" || note "the banner does not carry the fixed build identity"
     echo "$banner" | sed -E "s/$ident//" | grep -q -E -f "$pat" && note "the banner names the build environment"
