@@ -76,6 +76,16 @@ Every build that is installed anywhere needs its own version: the Debian revisio
 kernel release name and of the package names, and modules are signed with a key that only exists
 during the build.
 
+## Source package
+
+    make dsc PKG_BUILD_DIR=/build/kernel
+
+writes a Debian source package (format 3.0 (quilt)) to `PKG_BUILD_DIR/source`: the orig tarball is
+the pinned upstream tree without its `debian/` directory (about 160 MB, the same file for every
+revision on one upstream tag), the debian tarball is the `debian/` directory exactly as
+`make prepare` builds it, including the kernel patches and the ZFS packaging. Unpacking it with
+`dpkg-source -x` gives the tree the binary packages are built from.
+
 ## Adding kernel patches
 
     scripts/import-patches.sh <topic> <directory> <new version> "<changelog line>" [<patch>...]

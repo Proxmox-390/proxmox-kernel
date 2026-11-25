@@ -47,6 +47,12 @@ deb: prepare
 deb-continue:
 	cd '$(SRC_DIR)' && $(CLEAN_MAKE_ENV) dpkg-buildpackage -b -uc -us -nc --jobs=$(PKG_JOBS)
 
+# the Debian source package (.dsc, orig and debian tarballs) in $(PKG_BUILD_DIR)/source
+.PHONY: dsc
+dsc: fetch
+	rm -rf '$(PKG_BUILD_DIR)/source'
+	scripts/make-source.sh '$(PKG_BUILD_DIR)/source'
+
 # refresh config/config-s390x for the pinned upstream tree, see README.md
 .PHONY: updateconfig
 updateconfig: fetch
@@ -58,7 +64,7 @@ check:
 
 .PHONY: clean
 clean:
-	rm -rf '$(SRC_DIR)' '$(PKG_BUILD_DIR)/updateconfig'
+	rm -rf '$(SRC_DIR)' '$(PKG_BUILD_DIR)/updateconfig' '$(PKG_BUILD_DIR)/source'
 
 .PHONY: distclean
 distclean:
