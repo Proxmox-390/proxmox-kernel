@@ -1,3 +1,11 @@
+proxmox-kernel-7.3 (7.3.6-1+s390x3) trixie; urgency=medium
+
+  * rebuild from the published packaging repository: no change to the
+    kernel code; the selftest of the vsie fix skips cleanly where the
+    host refuses nested guests in ESA mode.
+
+ -- Yvan Janssens <yvanj@cyber.gent>  Wed, 25 Nov 2026 14:59:39 +0000
+
 proxmox-kernel-7.3 (7.3.6-1+s390x2) trixie; urgency=medium
 
   * KVM: s390: vsie: rewind the PSW of nested guests in ESA mode in the
