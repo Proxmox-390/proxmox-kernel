@@ -1,3 +1,10 @@
+proxmox-kernel-7.3 (7.3.6-1+s390x4) trixie; urgency=medium
+
+  * kvm-vsie: carry the two patches exactly as signed off and submitted
+    upstream. No change to the kernel code.
+
+ -- Yvan Janssens <yvanj@cyber.gent>  Wed, 25 Nov 2026 15:54:20 +0000
+
 proxmox-kernel-7.3 (7.3.6-1+s390x3) trixie; urgency=medium
 
   * rebuild from the published packaging repository: no change to the
