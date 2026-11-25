@@ -47,15 +47,15 @@ On Debian 13 (trixie), s390x, with about 25 GB of free disk space:
 
     apt install git build-essential devscripts quilt
     make fetch                                  # upstream tree into ./upstream
-    make prepare BUILD_DIR=/build/kernel        # source tree, see below
+    make prepare PKG_BUILD_DIR=/build/kernel        # source tree, see below
     (cd /build/kernel/proxmox-kernel-7.3-*/ && mk-build-deps -ir debian/control)
-    make deb BUILD_DIR=/build/kernel
+    make deb PKG_BUILD_DIR=/build/kernel
 
 `make deb` alone does all steps once the build dependencies are installed (it removes nothing:
-run `make clean` before preparing again). The packages end up in `BUILD_DIR`. `JOBS=<n>` limits
+run `make clean` before preparing again). The packages end up in `PKG_BUILD_DIR`. `PKG_JOBS=<n>` limits
 the parallelism, `make deb-continue` continues a failed build in the prepared tree.
 
-`BUILD_DIR` defaults to `./build`. Its path is recorded in a few places of the result (assertion
+`PKG_BUILD_DIR` defaults to `./build`. Its path is recorded in a few places of the result (assertion
 messages of the ZFS modules, generated files of the headers package), so use a neutral path for
 packages that are distributed.
 

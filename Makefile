@@ -15,11 +15,16 @@ UPSTREAM_VERSION := $(firstword $(subst -, ,$(VERSION)))
 UPSTREAM_DIR ?= $(CURDIR)/upstream
 # where the source is prepared and built; the path ends up in a few binaries,
 # use a neutral one for packages meant for distribution
-BUILD_DIR ?= $(CURDIR)/build
-SRC_DIR = $(BUILD_DIR)/$(SOURCE_PKG)-$(UPSTREAM_VERSION)
-JOBS ?= $(shell nproc)
+PKG_BUILD_DIR ?= $(CURDIR)/build
+SRC_DIR = $(PKG_BUILD_DIR)/$(SOURCE_PKG)-$(UPSTREAM_VERSION)
+PKG_JOBS ?= $(shell nproc)
 
 export UPSTREAM_DIR
+
+# the package build is a make of its own: variables given on this make's
+# command line must not reach it (debian/rules and the kernel have variables
+# of their own with common names)
+CLEAN_MAKE_ENV = env -u MAKEFLAGS -u MFLAGS -u MAKEOVERRIDES -u MAKELEVEL
 
 .PHONY: all
 all: deb
@@ -34,18 +39,18 @@ prepare: fetch
 
 .PHONY: deb
 deb: prepare
-	cd '$(SRC_DIR)' && dpkg-checkbuilddeps && dpkg-buildpackage -b -uc -us --jobs=$(JOBS)
-	@echo "packages for $(VERSION) are in $(BUILD_DIR)/"
+	cd '$(SRC_DIR)' && dpkg-checkbuilddeps && $(CLEAN_MAKE_ENV) dpkg-buildpackage -b -uc -us --jobs=$(PKG_JOBS)
+	@echo "packages for $(VERSION) are in $(PKG_BUILD_DIR)/"
 
 # continue a failed build in the prepared tree
 .PHONY: deb-continue
 deb-continue:
-	cd '$(SRC_DIR)' && dpkg-buildpackage -b -uc -us -nc --jobs=$(JOBS)
+	cd '$(SRC_DIR)' && $(CLEAN_MAKE_ENV) dpkg-buildpackage -b -uc -us -nc --jobs=$(PKG_JOBS)
 
 # refresh config/config-s390x for the pinned upstream tree, see README.md
 .PHONY: updateconfig
 updateconfig: fetch
-	scripts/update-config.sh '$(BUILD_DIR)/updateconfig'
+	scripts/update-config.sh '$(PKG_BUILD_DIR)/updateconfig'
 
 .PHONY: check
 check:
@@ -53,8 +58,8 @@ check:
 
 .PHONY: clean
 clean:
-	rm -rf '$(SRC_DIR)' '$(BUILD_DIR)/updateconfig'
+	rm -rf '$(SRC_DIR)' '$(PKG_BUILD_DIR)/updateconfig'
 
 .PHONY: distclean
 distclean:
-	rm -rf '$(BUILD_DIR)' '$(UPSTREAM_DIR)'
+	rm -rf '$(PKG_BUILD_DIR)' '$(UPSTREAM_DIR)'
