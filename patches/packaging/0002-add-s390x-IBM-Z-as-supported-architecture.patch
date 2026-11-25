@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
+Date: Wed, 25 Nov 2026 12:32:49 +0000
+Subject: [PATCH] add s390x (IBM Z) as supported architecture
+
+The kernel image is arch/s390/boot/bzImage, installed as vmlinuz. The
+boot record is written by zipl from s390-tools, which takes the place
+of GRUB in the image package's Recommends. No firmware package is
+needed and Rust is not built.
+
+The kernel configuration (debian/config/config-s390x) and its override
+list (debian/rules.d/config-s390x.opts) are kept in the packaging
+repository and copied into the tree when the source is prepared.
+
+---
+ debian/rules            |  2 +-
+ debian/rules.d/s390x.mk | 11 +++++++++++
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+ create mode 100644 debian/rules.d/s390x.mk
+
+diff --git a/debian/rules b/debian/rules
+index 5d082b720304..1013d3eb85a8 100755
+--- a/debian/rules
++++ b/debian/rules
+@@ -12,7 +12,7 @@
+ 
+ include /usr/share/dpkg/default.mk
+ 
+-SUPPORTED_ARCHS = amd64 arm64
++SUPPORTED_ARCHS = amd64 arm64 s390x
+ ifeq ($(filter $(DEB_BUILD_ARCH),$(SUPPORTED_ARCHS)),)
+ $(error Unsupported architecture: $(DEB_BUILD_ARCH). Supported: $(SUPPORTED_ARCHS))
+ endif
+diff --git a/debian/rules.d/s390x.mk b/debian/rules.d/s390x.mk
+new file mode 100644
+index 000000000000..62594a76546f
+--- /dev/null
++++ b/debian/rules.d/s390x.mk
+@@ -0,0 +1,11 @@
++KERNEL_BUILD_ARCH   = s390
++KERNEL_HEADER_ARCH  = $(KERNEL_BUILD_ARCH)
++KERNEL_BUILD_IMAGE  = bzImage
++KERNEL_IMAGE_PATH   = arch/$(KERNEL_BUILD_ARCH)/boot/$(KERNEL_BUILD_IMAGE)
++KERNEL_INSTALL_FILE = vmlinuz
++# no GRUB on IBM Z: the boot record is written by zipl from s390-tools
++GRUB_RECOMMENDS     = s390-tools
++# no firmware package is needed to boot or to run the supported I/O devices
++FIRMWARE_DEPENDS    =
++# the Rust toolchain is not a build dependency on this architecture
++NEED_RUST           = no

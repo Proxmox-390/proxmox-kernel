@@ -1,0 +1,11 @@
+proxmox-kernel-7.3 (7.3.6-1+s390x1) trixie; urgency=medium
+
+  * s390x port: build for IBM Z (s390x), booted through zipl.
+  * s390x: kernel config based on the Debian s390x config of the 7.3 series
+    plus the common Proxmox overrides; additionally enable vfio-ccw, vfio-ap,
+    protected key support and kexec.
+  * s390x: no dependency on pve-firmware, no signed-template package and no
+    Rust build dependencies.
+
+ -- Yvan Janssens <yvanj@cyber.gent>  Wed, 25 Nov 2026 10:30:41 +0000
+

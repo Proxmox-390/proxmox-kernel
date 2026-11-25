@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
+Date: Wed, 25 Nov 2026 12:32:49 +0000
+Subject: [PATCH] d/rules, d/control: name the s390x packaging repository as
+ the source
+
+The packages are built from a packaging repository that takes this tree
+at a pinned tag and applies its patches. debian/SOURCE names that
+repository and its commit, followed by the upstream repository, tag and
+commit it was prepared from (debian/source-upstream, written when the
+source is prepared).
+
+---
+ debian/control.in | 4 ++--
+ debian/rules      | 5 +++--
+ 2 files changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/debian/control.in b/debian/control.in
+index 2218f221e3f7..acde81f24fc0 100644
+--- a/debian/control.in
++++ b/debian/control.in
+@@ -40,8 +40,8 @@ Build-Depends: asciidoc-base,
+                zstd,
+ Build-Conflicts: proxmox-headers-@KVNAME@,
+ Standards-Version: 4.6.2
+-Vcs-Git: git://git.proxmox.com/git/proxmox-kernel.git
+-Vcs-Browser: https://git.proxmox.com/?p=proxmox-kernel.git
++Vcs-Git: https://github.com/Proxmox-390/proxmox-kernel.git
++Vcs-Browser: https://github.com/Proxmox-390/proxmox-kernel
+ 
+ Package: linux-tools-@KVMAJMIN@
+ Architecture: any
+diff --git a/debian/rules b/debian/rules
+index 1013d3eb85a8..984b47bfa666 100755
+--- a/debian/rules
++++ b/debian/rules
+@@ -148,8 +148,9 @@ $(STAMPS)/templates: $(STAMPS)/control-check
+ # debian/source-commit is written by the gbp postexport hook, as the
+ # exported tree carries no git metadata
+ debian/SOURCE:
+-	printf 'git clone git://git.proxmox.com/git/proxmox-kernel.git\ngit checkout %s\n' \
+-	    "$$(cat debian/source-commit 2>/dev/null || git rev-parse HEAD 2>/dev/null || echo unknown)" > $@
++	printf 'git clone https://github.com/Proxmox-390/proxmox-kernel.git\ngit checkout %s\n' \
++	    "$$(cat debian/source-commit 2>/dev/null || echo unknown)" > $@
++	cat debian/source-upstream >> $@
+ 
+ build: $(STAMPS)/compile $(STAMPS)/tools-compile $(STAMPS)/modules-compile
+ build-arch: build

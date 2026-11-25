@@ -1,0 +1,32 @@
+# s390x-specific kernel config overrides for Proxmox VE
+#
+# The base config is Debian's s390x kernel config of the same kernel series,
+# so every channel I/O, crypto and KVM driver Debian ships is kept.
+# Common PVE options are in config-common.opts.
+#
+# debian/rules strips and signs the installed *.ko files itself, as on the
+# other architectures; modules must therefore not be compressed on install
+-d CONFIG_MODULE_COMPRESS_ALL
+# no Rust toolchain in the build, keep the result independent of the build host
+-d CONFIG_RUST
+-d CONFIG_ANDROID_BINDER_IPC
+-d CONFIG_ANDROID_BINDERFS
+# options of config-common.opts without meaning on IBM Z
+-d CONFIG_HYPERV
+-d CONFIG_SYSFB_SIMPLEFB
+-d CONFIG_DRM_SIMPLEDRM
+# device pass-through to guests: channel devices (vfio-ccw) and crypto
+# adapter domains (vfio-ap); not enabled in Debian's config
+-m CONFIG_VFIO_CCW
+-m CONFIG_VFIO_AP
+# protected key support for the CPACF/crypto adapter based ciphers
+-m CONFIG_PKEY
+-m CONFIG_PKEY_CCA
+-m CONFIG_PKEY_EP11
+-m CONFIG_PKEY_PCKMO
+-m CONFIG_PKEY_UV
+-m CONFIG_CRYPTO_PAES_S390
+-m CONFIG_CRYPTO_PHMAC_S390
+# boot a newly installed kernel without changing the IPL record
+-e CONFIG_KEXEC
+-e CONFIG_KEXEC_FILE

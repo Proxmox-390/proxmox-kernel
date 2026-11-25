@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
+Date: Wed, 25 Nov 2026 12:32:49 +0000
+Subject: [PATCH] d/rules, d/control: make firmware dependency, signing
+ template and Rust per architecture
+
+The series meta package depends on pve-firmware through a substitution
+variable, so that an architecture fragment in debian/rules.d can leave
+it out. The signed-template package only makes sense where the kernel
+is signed for UEFI Secure Boot and is limited to amd64 and arm64, like
+the Rust toolchain build dependencies. updateconfig only insists on a
+Rust toolchain where the architecture fragment does not opt out.
+
+---
+ debian/control.in | 14 +++++++-------
+ debian/rules      | 10 ++++++++--
+ 2 files changed, 15 insertions(+), 9 deletions(-)
+
+diff --git a/debian/control.in b/debian/control.in
+index 09fa1a59a779..2218f221e3f7 100644
+--- a/debian/control.in
++++ b/debian/control.in
+@@ -5,7 +5,7 @@ Maintainer: Proxmox Support Team <support@proxmox.com>
+ Build-Depends: asciidoc-base,
+                automake,
+                bc,
+-               bindgen,
++               bindgen [amd64 arm64],
+                bison,
+                cpio,
+                debhelper-compat (= 13),
+@@ -30,10 +30,10 @@ Build-Depends: asciidoc-base,
+                python3-dev,
+                python3-minimal,
+                rsync,
+-               rustc,
+-               rust-src,
+-               rustfmt,
+-               rust-clippy,
++               rustc [amd64 arm64],
++               rust-src [amd64 arm64],
++               rustfmt [amd64 arm64],
++               rust-clippy [amd64 arm64],
+                sphinx-common,
+                xmlto,
+                zlib1g-dev,
+@@ -87,7 +87,7 @@ Description: Proxmox Kernel debug image
+  in their unstripped version.
+ 
+ Package: proxmox-kernel-@KVNAME@-signed-template
+-Architecture: any
++Architecture: amd64 arm64
+ Depends: ${shlibs:Depends}, ${misc:Depends}, make | build-essential | dpkg-dev
+ Description: Template for signed kernel package
+  This package is used to control code signing by the Proxmox signing
+@@ -124,7 +124,7 @@ Section: admin
+ Provides: linux-image-${kernel:debarch}, linux-image-generic, wireguard-modules (=1.0.0), pve-kernel-@KVMAJMIN@
+ Replaces: pve-kernel-@KVMAJMIN@
+ Priority: optional
+-Depends: pve-firmware, proxmox-kernel-@KVNAME@-signed | proxmox-kernel-@KVNAME@, ${misc:Depends},
++Depends: ${kernel:firmware-depends}, proxmox-kernel-@KVNAME@-signed | proxmox-kernel-@KVNAME@, ${misc:Depends},
+ Description: Latest Proxmox Kernel Image
+  This is a metapackage which will install the latest available
+  proxmox kernel from the @KVMAJMIN@ series.
+diff --git a/debian/rules b/debian/rules
+index f85e835f80bc..5d082b720304 100755
+--- a/debian/rules
++++ b/debian/rules
+@@ -17,6 +17,10 @@ ifeq ($(filter $(DEB_BUILD_ARCH),$(SUPPORTED_ARCHS)),)
+ $(error Unsupported architecture: $(DEB_BUILD_ARCH). Supported: $(SUPPORTED_ARCHS))
+ endif
+ 
++# defaults, a debian/rules.d/<arch>.mk may override them
++FIRMWARE_DEPENDS = pve-firmware
++NEED_RUST = yes
++
+ include debian/rules.d/$(DEB_BUILD_ARCH).mk
+ 
+ MAKEFLAGS += $(subst parallel=,-j,$(filter parallel=%,${DEB_BUILD_OPTIONS}))
+@@ -165,7 +169,8 @@ binary: install
+ 	dh_makeshlibs
+ 	dh_shlibdeps
+ 	dh_installdeb
+-	dh_gencontrol -- -Vkernel:debarch=$(DEB_BUILD_ARCH) '-Vkernel:grub-recommends=$(GRUB_RECOMMENDS)'
++	dh_gencontrol -- -Vkernel:debarch=$(DEB_BUILD_ARCH) '-Vkernel:grub-recommends=$(GRUB_RECOMMENDS)' \
++	    '-Vkernel:firmware-depends=$(FIRMWARE_DEPENDS)'
+ 	dh_md5sums
+ 	dh_builddeb
+ 
+@@ -445,7 +450,8 @@ updateconfig:
+ 	$(MAKE) olddefconfig
+ 	# Kconfig silently disables options whose tools are missing, like BTF without pahole, and
+ 	# olddefconfig would keep them disabled in the committed config from then on
+-	@grep -q '^CONFIG_RUST_IS_AVAILABLE=y' .config && ! grep -q '^CONFIG_PAHOLE_VERSION=0$$' .config || \
++	@{ test '$(NEED_RUST)' != yes || grep -q '^CONFIG_RUST_IS_AVAILABLE=y' .config; } && \
++	    ! grep -q '^CONFIG_PAHOLE_VERSION=0$$' .config || \
+ 	    { echo "pahole or the Rust toolchain are missing, install the build dependencies" >&2; false; }
+ 	cp .config debian/config/config-$(DEB_BUILD_ARCH)
+ 
