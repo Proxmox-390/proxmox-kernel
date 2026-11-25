@@ -1,4 +1,4 @@
-From 50263ec9c23fd31def555cbb4d3336d6d1138dc0 Mon Sep 17 00:00:00 2001
+From 527114ebd50b15e168dd697a1a688d7b037cd7aa Mon Sep 17 00:00:00 2001
 From: Yvan Janssens <yvanj@cyber.gent>
 Date: Wed, 25 Nov 2026 12:40:11 +0100
 Subject: [PATCH 2/2] KVM: s390: selftests: Add a test for nested guests in ESA
@@ -21,6 +21,7 @@ execution for the guest (SIEF2) and without facility 7 in the guest's
 model.
 
 Assisted-by: Claude:claude-fable-5-2
+Signed-off-by: Yvan Janssens <yvanj@cyber.gent>
 ---
  tools/testing/selftests/kvm/Makefile.kvm      |   1 +
  .../selftests/kvm/s390/vsie_esa_test.c        | 181 ++++++++++++++++++
