@@ -1,0 +1,94 @@
+From 61bafaea2e4a9470779eaed225ee020c34af98f3 Mon Sep 17 00:00:00 2001
+From: Proxmox-390 kernel work <devnull@localhost>
+Date: Wed, 25 Nov 2026 12:40:11 +0100
+Subject: [PATCH 01/10] KVM: s390: vsie: Rewind the PSW of ESA mode guests in
+ the right format
+
+A state description without the z/Architecture flag holds the eight-byte
+ESA/390 PSW in the first doubleword of its PSW field: the addressing mode
+is bit 32 and the instruction address is in bits 33-63 of that doubleword
+(Principles of Operation, "Program-Status Word" as it applies in the
+ESA/390-compatibility mode). The second doubleword is not part of the
+PSW.
+
+Since nested guests can be run in ESA mode, vsie still rewinds the PSW of
+their shadow state description as if it were a z/Architecture PSW. It
+subtracts the instruction length from the second doubleword, which leaves
+the instruction address alone and stores a wrapped address there
+(0x7ffffffc for one four-byte instruction). The value is copied back into
+the state description of guest 2 when the shadow is released.
+
+The rewind is how vsie repeats an instruction: STORE FACILITY LIST
+EXTENDED after the facility list that guest 2 designates has been
+shadowed (handle_stfle()), MOVE PAGE after a fault was resolved
+(vsie_handle_mvpg()), and the instruction that is reported with an
+addressing exception when guest 3 touches memory guest 2 does not have.
+For a guest in ESA mode the instruction is skipped instead. The first
+STORE FACILITY LIST EXTENDED after every entry into SIE returns with its
+operand and the condition code untouched, so a program in the nested
+guest that looks at the facility list sees zeros.
+
+Rewind the instruction address where the format of the state description
+has it.
+
+The selftest in the next patch reproduces the problem: on 7.3.6 the
+second doubleword of the PSW field comes back as 0x7ffffff8 after two
+skipped instructions and the nested guest never stores a facility list.
+
+Fixes: b0ad874d9852 ("KVM: s390: vsie: Allow non-zarch guests")
+Assisted-by: Claude:claude-fable-5-2
+---
+ arch/s390/kvm/s390/vsie.c | 23 +++++++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/arch/s390/kvm/s390/vsie.c b/arch/s390/kvm/s390/vsie.c
+index 5926689fa226..de8398b265aa 100644
+--- a/arch/s390/kvm/s390/vsie.c
++++ b/arch/s390/kvm/s390/vsie.c
+@@ -987,6 +987,25 @@ static inline void clear_vsie_icpt(struct vsie_page *vsie_page)
+ 	vsie_page->scb_s.icptcode = 0;
+ }
+ 
++/*
++ * Rewind the PSW of a shadow scb. An ESA mode guest has the eight-byte
++ * ESA/390 PSW in the first doubleword of the PSW field: the addressing mode
++ * in bit 32 and the instruction address in bits 33-63. The second doubleword
++ * is not part of its PSW.
++ */
++static void vsie_rewind_psw(struct kvm_s390_sie_block *scb, int ilen)
++{
++	u64 addr_mask;
++
++	if (atomic_read(&scb->cpuflags) & CPUSTAT_ZARCH) {
++		scb->gpsw.addr = __rewind_psw(scb->gpsw, ilen);
++		return;
++	}
++	addr_mask = scb->gpsw.mask & PSW32_ADDR_AMODE ? PSW32_ADDR_INSN : 0x00ffffffUL;
++	scb->gpsw.mask = (scb->gpsw.mask & ~PSW32_ADDR_INSN) |
++			 ((scb->gpsw.mask - ilen) & addr_mask);
++}
++
+ /* rewind the psw and clear the vsie icpt, so we can retry execution */
+ static void retry_vsie_icpt(struct vsie_page *vsie_page)
+ {
+@@ -999,7 +1018,7 @@ static void retry_vsie_icpt(struct vsie_page *vsie_page)
+ 		if (!ilen)
+ 			ilen = 4;
+ 	}
+-	scb_s->gpsw.addr = __rewind_psw(scb_s->gpsw, ilen);
++	vsie_rewind_psw(scb_s, ilen);
+ 	clear_vsie_icpt(vsie_page);
+ }
+ 
+@@ -1452,7 +1471,7 @@ static int vsie_run(struct kvm_vcpu *vcpu, struct vsie_page *vsie_page)
+ 		scb_s->icptcode = ICPT_PROGI;
+ 		scb_s->iprcc = PGM_ADDRESSING;
+ 		scb_s->pgmilc = 4;
+-		scb_s->gpsw.addr = __rewind_psw(scb_s->gpsw, 4);
++		vsie_rewind_psw(scb_s, 4);
+ 		rc = 1;
+ 	}
+ 	return rc;
+-- 
+2.47.3
+
