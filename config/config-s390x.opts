@@ -30,3 +30,10 @@
 # boot a newly installed kernel without changing the IPL record
 -e CONFIG_KEXEC
 -e CONFIG_KEXEC_FILE
+# legacy ebtables (old sockopt interface): the ebtables tool used by
+# pve-firewall needs the ebtables module and its tables; Proxmox enables
+# them on amd64 and arm64, Debian s390x does not
+-m CONFIG_BRIDGE_NF_EBTABLES_LEGACY
+-m CONFIG_BRIDGE_EBT_BROUTE
+-m CONFIG_BRIDGE_EBT_T_FILTER
+-m CONFIG_BRIDGE_EBT_T_NAT

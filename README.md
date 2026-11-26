@@ -132,6 +132,8 @@ in the upstream tree) and `config/config-s390x.opts`, which
 - keeps modules uncompressed on install (the packaging strips and signs them itself),
 - enables vfio-ccw and vfio-ap device pass-through, protected key support and kexec, none of which
   Debian's configuration has,
+- enables legacy ebtables (the module and its filter, nat and broute tables) for the Proxmox VE
+  firewall, as Proxmox does on amd64 and arm64,
 - switches off Rust, the Android binder and options of the common list that do not apply.
 
 ## Booting
