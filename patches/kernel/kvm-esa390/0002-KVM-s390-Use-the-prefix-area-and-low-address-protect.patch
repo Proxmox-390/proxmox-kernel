@@ -1,0 +1,239 @@
+From 8c86b404c776132dd107fd19a13c05eff12458a8 Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
+Date: Wed, 25 Nov 2026 12:40:12 +0100
+Subject: [RFC PATCH 2/7] KVM: s390: Use the prefix area and low-address
+ protection of the mode
+
+Guest accesses that KVM makes itself have to follow the rules of the
+ESA/390-compatibility mode while the configuration is in it (Principles
+of Operation, "Prefixing" and "Low-Address Protection"):
+
+- the prefix area is one 4K block, so only real addresses 0-4095 and the
+  block the prefix designates are exchanged;
+- low-address protection applies to effective addresses 0-511 only, not
+  to 4096-4607;
+- SET PREFIX takes bits 1-19 of its operand.
+
+Only the pages of the prefix area are made present and marked for
+notification before SIE is entered. dat_set_prefix_notif_bit() gets the
+number of pages as an argument for that: with a 4K prefix area the block
+behind the prefix need not be backed by a memory slot.
+
+No functional change as long as no vCPU is in the mode.
+
+Assisted-by: Claude:claude-fable-5-2
+---
+ arch/s390/kvm/gmap/dat.c     | 29 +++++++++++++++++++++--------
+ arch/s390/kvm/gmap/dat.h     |  4 ++--
+ arch/s390/kvm/s390/gaccess.c |  9 ++++++---
+ arch/s390/kvm/s390/gaccess.h | 11 ++++++++++-
+ arch/s390/kvm/s390/priv.c    |  7 ++++---
+ arch/s390/kvm/s390/s390.c    | 16 ++++++++--------
+ 6 files changed, 51 insertions(+), 25 deletions(-)
+
+diff --git a/arch/s390/kvm/gmap/dat.c b/arch/s390/kvm/gmap/dat.c
+index ff80d02c9f56..75b2a636f6d4 100644
+--- a/arch/s390/kvm/gmap/dat.c
++++ b/arch/s390/kvm/gmap/dat.c
+@@ -1022,10 +1022,15 @@ bool dat_test_age_gfn(union asce asce, gfn_t start, gfn_t end)
+ }
+ 
+ #if KVM_S390_MANAGES_S390_GUEST
++struct dat_set_pn_priv {
++	int nr_pages;
++	int n;
++};
++
+ static long dat_set_pn_crste(union crste *crstep, gfn_t gfn, gfn_t next, struct dat_walk *walk)
+ {
++	struct dat_set_pn_priv *priv = walk->priv;
+ 	union crste newcrste, oldcrste;
+-	int *n = walk->priv;
+ 
+ 	do {
+ 		oldcrste = READ_ONCE(*crstep);
+@@ -1036,25 +1041,33 @@ static long dat_set_pn_crste(union crste *crstep, gfn_t gfn, gfn_t next, struct
+ 		newcrste = oldcrste;
+ 		newcrste.s.fc1.prefix_notif = 1;
+ 	} while (!dat_crstep_xchg_atomic(crstep, oldcrste, newcrste, gfn, walk->asce));
+-	*n = 2;
++	priv->n = priv->nr_pages;
+ 	return 0;
+ }
+ 
+ static long dat_set_pn_pte(union pte *ptep, gfn_t gfn, gfn_t next, struct dat_walk *walk)
+ {
+-	int *n = walk->priv;
++	struct dat_set_pn_priv *priv = walk->priv;
+ 	union pgste pgste;
+ 
+ 	pgste = pgste_get_lock(ptep);
+ 	if (!ptep->h.i && !ptep->h.p) {
+ 		pgste.prefix_notif = 1;
+-		*n += 1;
++		priv->n += 1;
+ 	}
+ 	pgste_set_unlock(ptep, pgste);
+ 	return 0;
+ }
+ 
+-int dat_set_prefix_notif_bit(union asce asce, gfn_t gfn)
++/**
++ * dat_set_prefix_notif_bit() - Arm the prefix notification for a prefix area.
++ * @asce: The asce to operate on.
++ * @gfn: The first guest page frame of the prefix area.
++ * @nr_pages: The number of pages of the prefix area.
++ *
++ * Return: 0 if all pages are mapped and marked, -EAGAIN otherwise.
++ */
++int dat_set_prefix_notif_bit(union asce asce, gfn_t gfn, int nr_pages)
+ {
+ 	static const struct dat_walk_ops ops = {
+ 		.pte_entry = dat_set_pn_pte,
+@@ -1062,10 +1075,10 @@ int dat_set_prefix_notif_bit(union asce asce, gfn_t gfn)
+ 		.pud_entry = dat_set_pn_crste,
+ 	};
+ 
+-	int n = 0;
++	struct dat_set_pn_priv priv = { .nr_pages = nr_pages };
+ 
+-	_dat_walk_gfn_range(gfn, gfn + 2, asce, &ops, DAT_WALK_IGN_HOLES, &n);
+-	if (n != 2)
++	_dat_walk_gfn_range(gfn, gfn + nr_pages, asce, &ops, DAT_WALK_IGN_HOLES, &priv);
++	if (priv.n != nr_pages)
+ 		return -EAGAIN;
+ 	return 0;
+ }
+diff --git a/arch/s390/kvm/gmap/dat.h b/arch/s390/kvm/gmap/dat.h
+index 90389d47ba4e..a328a1d40148 100644
+--- a/arch/s390/kvm/gmap/dat.h
++++ b/arch/s390/kvm/gmap/dat.h
+@@ -550,9 +550,9 @@ void dat_set_ptval(struct page_table *table, struct ptval_param param, unsigned
+ int dat_set_slot(struct kvm_s390_mmu_cache *mc, union asce asce, gfn_t start, gfn_t end);
+ 
+ #if KVM_S390_MANAGES_S390_GUEST
+-int dat_set_prefix_notif_bit(union asce asce, gfn_t gfn);
++int dat_set_prefix_notif_bit(union asce asce, gfn_t gfn, int nr_pages);
+ #else
+-static inline int dat_set_prefix_notif_bit(union asce asce, gfn_t gfn)
++static inline int dat_set_prefix_notif_bit(union asce asce, gfn_t gfn, int nr_pages)
+ {
+ 	return 0;
+ }
+diff --git a/arch/s390/kvm/s390/gaccess.c b/arch/s390/kvm/s390/gaccess.c
+index 405345ccc4f1..1b80c0c1823b 100644
+--- a/arch/s390/kvm/s390/gaccess.c
++++ b/arch/s390/kvm/s390/gaccess.c
+@@ -627,8 +627,11 @@ static unsigned long guest_translate_gva(struct kvm_vcpu *vcpu, unsigned long gv
+ 	return 0;
+ }
+ 
+-static inline int is_low_address(unsigned long ga)
++static inline int is_low_address(struct kvm_vcpu *vcpu, unsigned long ga)
+ {
++	/* ESA/390-compatibility mode: only the address range 0..511 */
++	if (kvm_s390_vcpu_is_esa(vcpu))
++		return (ga & ~0x1fful) == 0;
+ 	/* Check for address ranges 0..511 and 4096..4607 */
+ 	return (ga & ~0x11fful) == 0;
+ }
+@@ -783,7 +786,7 @@ static int guest_range_to_gpas(struct kvm_vcpu *vcpu, unsigned long ga, u8 ar,
+ 	while (min(PAGE_SIZE - offset, len) > 0) {
+ 		fragment_len = min(PAGE_SIZE - offset, len);
+ 		ga = kvm_s390_logical_to_effective(vcpu, ga);
+-		if (mode == GACC_STORE && lap_enabled && is_low_address(ga))
++		if (mode == GACC_STORE && lap_enabled && is_low_address(vcpu, ga))
+ 			return trans_exc(vcpu, PGM_PROTECTION, ga, ar, mode,
+ 					 PROT_TYPE_LA);
+ 		if (psw_bits(*psw).dat) {
+@@ -1255,7 +1258,7 @@ int kvm_s390_check_low_addr_prot_real(struct kvm_vcpu *vcpu, unsigned long gra)
+ {
+ 	union ctlreg0 ctlreg0 = {.val = vcpu->arch.sie_block->gcr[0]};
+ 
+-	if (!ctlreg0.lap || !is_low_address(gra))
++	if (!ctlreg0.lap || !is_low_address(vcpu, gra))
+ 		return 0;
+ 	return trans_exc(vcpu, PGM_PROTECTION, gra, 0, GACC_STORE, PROT_TYPE_LA);
+ }
+diff --git a/arch/s390/kvm/s390/gaccess.h b/arch/s390/kvm/s390/gaccess.h
+index ef922b3b4990..021bc685d9b5 100644
+--- a/arch/s390/kvm/s390/gaccess.h
++++ b/arch/s390/kvm/s390/gaccess.h
+@@ -44,7 +44,16 @@ static inline unsigned long _kvm_s390_real_to_abs(u32 prefix, unsigned long gra)
+ static inline unsigned long kvm_s390_real_to_abs(struct kvm_vcpu *vcpu,
+ 						 unsigned long gra)
+ {
+-	return _kvm_s390_real_to_abs(kvm_s390_get_prefix(vcpu), gra);
++	u32 prefix = kvm_s390_get_prefix(vcpu);
++
++	if (!kvm_s390_vcpu_is_esa(vcpu))
++		return _kvm_s390_real_to_abs(prefix, gra);
++	/* ESA/390-compatibility mode: the prefix area is one page */
++	if (gra < PAGE_SIZE)
++		gra += prefix;
++	else if (gra >= prefix && gra < prefix + PAGE_SIZE)
++		gra -= prefix;
++	return gra;
+ }
+ 
+ /**
+diff --git a/arch/s390/kvm/s390/priv.c b/arch/s390/kvm/s390/priv.c
+index b3cb2c2c3aa7..139386a7475c 100644
+--- a/arch/s390/kvm/s390/priv.c
++++ b/arch/s390/kvm/s390/priv.c
+@@ -143,12 +143,13 @@ static int handle_set_prefix(struct kvm_vcpu *vcpu)
+ 	if (rc)
+ 		return kvm_s390_inject_prog_cond(vcpu, rc);
+ 
+-	address &= 0x7fffe000u;
++	address &= kvm_s390_prefix_addr_mask(vcpu);
+ 
+ 	/*
+ 	 * Make sure the new value is valid memory. We only need to check the
+-	 * first page, since address is 8k aligned and memory pieces are always
+-	 * at least 1MB aligned and have at least a size of 1MB.
++	 * first page, since the address is aligned to the size of the prefix
++	 * area and memory pieces are always at least 1MB aligned and have at
++	 * least a size of 1MB.
+ 	 */
+ 	if (!kvm_is_gpa_in_memslot(vcpu->kvm, address))
+ 		return kvm_s390_inject_program_int(vcpu, PGM_ADDRESSING);
+diff --git a/arch/s390/kvm/s390/s390.c b/arch/s390/kvm/s390/s390.c
+index e4912db67adc..06e016f83eaa 100644
+--- a/arch/s390/kvm/s390/s390.c
++++ b/arch/s390/kvm/s390/s390.c
+@@ -4312,23 +4312,23 @@ static int vcpu_ucontrol_translate(struct kvm_vcpu *vcpu, gpa_t *gaddr)
+ 
+ static int kvm_s390_fixup_prefix(struct kvm_vcpu *vcpu)
+ {
++	int nr_pages = kvm_s390_prefix_pages(vcpu);
+ 	gpa_t gaddr = kvm_s390_get_prefix(vcpu);
+ 	gfn_t gfn;
+-	int rc;
++	int i, rc;
+ 
+ 	if (vcpu_ucontrol_translate(vcpu, &gaddr))
+ 		return -EREMOTE;
+ 	gfn = gpa_to_gfn(gaddr);
+ 
+-	rc = kvm_s390_faultin_gfn_simple(vcpu, NULL, gfn, true);
+-	if (rc)
+-		return rc;
+-	rc = kvm_s390_faultin_gfn_simple(vcpu, NULL, gfn + 1, true);
+-	if (rc)
+-		return rc;
++	for (i = 0; i < nr_pages; i++) {
++		rc = kvm_s390_faultin_gfn_simple(vcpu, NULL, gfn + i, true);
++		if (rc)
++			return rc;
++	}
+ 
+ 	scoped_guard(write_lock, &vcpu->kvm->mmu_lock)
+-		rc = dat_set_prefix_notif_bit(vcpu->kvm->arch.gmap->asce, gfn);
++		rc = dat_set_prefix_notif_bit(vcpu->kvm->arch.gmap->asce, gfn, nr_pages);
+ 	return rc;
+ }
+ 
+-- 
+2.47.3
+

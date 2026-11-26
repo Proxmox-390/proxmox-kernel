@@ -1,0 +1,130 @@
+From c967290b5d6453b1c74e7032e74e8a004e9fa942 Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
+Date: Wed, 25 Nov 2026 12:40:12 +0100
+Subject: [RFC PATCH 1/7] KVM: s390: Add helpers for the ESA/390-compatibility
+ mode
+
+The ESA/390-compatibility mode is the architectural mode in which a
+machine with the configuration-z/Architecture-architectural-mode
+facility runs a guest whose state description lacks the z/Architecture
+flag (Principles of Operation, "ESA/390-Compatibility Mode" in chapter 1
+and "ESA/390-Compatibility-Mode Facility" in chapter 5). The guest has
+the ESA/390 formats of the PSW and of the assigned storage locations, a
+prefix area of 4K bytes, 31-bit registers and addresses and no dynamic
+address translation.
+
+Add what the following patches use to support the mode for the guests of
+KVM itself, without a way to turn it on yet:
+
+- two flags in struct kvm_arch: the mode can be used by the VM, and the
+  configuration is in the mode. kvm_s390_vcpu_is_esa() tests the latter;
+- the prefix helpers get the size of the prefix area from the mode.
+  kvm_s390_set_prefix() used to clear the bit that only an ESA/390 prefix
+  has after it stored the value; it now applies the mask of the mode
+  first;
+- conversion between the 16-byte PSW that KVM and its user space interface
+  use everywhere and the eight-byte ESA/390 PSW (bit 12 one, addressing
+  mode in bit 32, instruction address in bits 33-63).
+
+No functional change: no vCPU can be in the mode.
+
+Assisted-by: Claude:claude-fable-5-2
+---
+ arch/s390/include/asm/kvm_host_s390.h |  2 ++
+ arch/s390/kvm/s390/s390.h             | 51 ++++++++++++++++++++++++++-
+ 2 files changed, 52 insertions(+), 1 deletion(-)
+
+diff --git a/arch/s390/include/asm/kvm_host_s390.h b/arch/s390/include/asm/kvm_host_s390.h
+index cd692f8fb764..9a220c7347fe 100644
+--- a/arch/s390/include/asm/kvm_host_s390.h
++++ b/arch/s390/include/asm/kvm_host_s390.h
+@@ -629,6 +629,8 @@ struct kvm_arch {
+ 	int user_instr0;
+ 	int user_operexec;
+ 	int allow_vsie_esamode;
++	bool esa390_cm;
++	bool esa390_cm_active;
+ 	struct s390_io_adapter *adapters[MAX_S390_IO_ADAPTERS];
+ 	wait_queue_head_t ipte_wq;
+ 	int ipte_lock_count;
+diff --git a/arch/s390/kvm/s390/s390.h b/arch/s390/kvm/s390/s390.h
+index aa0d1d062f8d..1ae9f0097285 100644
+--- a/arch/s390/kvm/s390/s390.h
++++ b/arch/s390/kvm/s390/s390.h
+@@ -122,6 +122,17 @@ static inline int kvm_is_ucontrol(struct kvm *kvm)
+ #endif
+ }
+ 
++/*
++ * The configuration is in the ESA/390-compatibility mode: all vCPUs run on
++ * state descriptions without the z/Architecture flag, which have an eight-byte
++ * ESA/390 PSW and a prefix for a prefix area of one page. The mode changes
++ * only while all vCPUs are locked, see kvm_s390_set_arch_mode().
++ */
++static inline bool kvm_s390_vcpu_is_esa(struct kvm_vcpu *vcpu)
++{
++	return vcpu->kvm->arch.esa390_cm_active;
++}
++
+ #define GUEST_PREFIX_SHIFT 12
+ #define GUEST_PREFIX_MASK_ZARCH 0x7fffe
+ #define GUEST_PREFIX_MASK_ESA   0x7ffff
+@@ -130,16 +141,54 @@ static inline u32 kvm_s390_get_prefix(struct kvm_vcpu *vcpu)
+ 	return vcpu->arch.sie_block->prefix << GUEST_PREFIX_SHIFT;
+ }
+ 
++/* the bits of an address that designate the prefix area */
++static inline u32 kvm_s390_prefix_addr_mask(struct kvm_vcpu *vcpu)
++{
++	if (kvm_s390_vcpu_is_esa(vcpu))
++		return GUEST_PREFIX_MASK_ESA << GUEST_PREFIX_SHIFT;
++	return GUEST_PREFIX_MASK_ZARCH << GUEST_PREFIX_SHIFT;
++}
++
++/* the number of pages of the prefix area */
++static inline int kvm_s390_prefix_pages(struct kvm_vcpu *vcpu)
++{
++	return kvm_s390_vcpu_is_esa(vcpu) ? 1 : 2;
++}
++
+ static inline void kvm_s390_set_prefix(struct kvm_vcpu *vcpu, u32 prefix)
+ {
+ 	VCPU_EVENT(vcpu, 3, "set prefix of cpu %03u to 0x%x", vcpu->vcpu_id,
+ 		   prefix);
++	prefix &= kvm_s390_prefix_addr_mask(vcpu);
+ 	vcpu->arch.sie_block->prefix = prefix >> GUEST_PREFIX_SHIFT;
+-	vcpu->arch.sie_block->prefix &= GUEST_PREFIX_MASK_ZARCH;
+ 	kvm_make_request(KVM_REQ_TLB_FLUSH, vcpu);
+ 	kvm_make_request(KVM_REQ_REFRESH_GUEST_PREFIX, vcpu);
+ }
+ 
++/*
++ * KVM and its user space interface keep the PSW in the 16-byte
++ * z/Architecture format in every architectural mode. The eight-byte ESA/390
++ * format is used in the state description of a vCPU in the
++ * ESA/390-compatibility mode while it is in SIE, and for the old and new
++ * PSWs in guest storage. Bit 12 is one in the eight-byte format and zero in
++ * the 16-byte format; bit 32 is the addressing mode, bits 33-63 hold the
++ * instruction address.
++ */
++#define PSW_ESA_BIT12	0x0008000000000000UL
++
++static inline u64 kvm_s390_psw_to_esa(const psw_t *psw)
++{
++	return ((psw->mask ^ PSW_ESA_BIT12) & ~(u64)U32_MAX) |
++	       (psw->mask & PSW32_ADDR_AMODE) | (psw->addr & PSW32_ADDR_INSN);
++}
++
++static inline void kvm_s390_psw_from_esa(psw_t *psw, u64 esa)
++{
++	psw->mask = ((esa ^ PSW_ESA_BIT12) & ~(u64)U32_MAX) |
++		    (esa & PSW32_ADDR_AMODE);
++	psw->addr = esa & PSW32_ADDR_INSN;
++}
++
+ static inline u64 kvm_s390_get_base_disp_s(struct kvm_vcpu *vcpu, u8 *ar)
+ {
+ 	u32 base2 = vcpu->arch.sie_block->ipb >> 28;
+-- 
+2.47.3
+

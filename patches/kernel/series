@@ -1,2 +1,13 @@
 kvm-vsie/0001-KVM-s390-vsie-Rewind-the-PSW-of-ESA-mode-guests-in-t.patch
 kvm-vsie/0002-KVM-s390-selftests-Add-a-test-for-nested-guests-in-E.patch
+kvm-esa390/0001-KVM-s390-Add-helpers-for-the-ESA-390-compatibility-m.patch
+kvm-esa390/0002-KVM-s390-Use-the-prefix-area-and-low-address-protect.patch
+kvm-esa390/0003-KVM-s390-Present-interruptions-in-ESA-390-format-in-.patch
+kvm-esa390/0004-KVM-s390-Refuse-in-the-mode-what-exists-only-in-z-Ar.patch
+kvm-esa390/0005-KVM-s390-Report-a-refused-ESA-390-format-state-descr.patch
+kvm-esa390/0006-KVM-s390-Add-KVM_CAP_S390_ESA390_CM.patch
+kvm-esa390/0007-KVM-s390-selftests-Add-a-test-for-the-ESA-390-compat.patch
+kvm-esa390/0008-KVM-s390-Add-ESA-390-address-translation-and-shadow-.patch
+kvm-esa390/0009-KVM-s390-Run-ESA-390-DAT-on-code-on-shadow-address-s.patch
+kvm-esa390/0010-KVM-s390-Add-KVM_S390_ESA390_CM_DAT.patch
+kvm-esa390/0011-KVM-s390-selftests-Add-a-test-for-ESA-390-DAT-shadow.patch

@@ -1,0 +1,63 @@
+From d04517bf722b7dc518ea142455cb002e31a0d271 Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
+Date: Wed, 25 Nov 2026 16:59:44 +0100
+Subject: [RFC PATCH 5/7] KVM: s390: Report a refused ESA/390-format state
+ description without a warning
+
+A machine or a hypervisor below KVM that does not run state descriptions
+without the z/Architecture flag answers SIE with a validity interception.
+A KVM below this one does that with reason code 0x0001 unless its user
+space enabled KVM_CAP_S390_VSIE_ESAMODE. Once user space can put a VM into
+the ESA/390-compatibility mode, it can reach this case on such a host, and
+handle_validity() would print a WARN with a backtrace for something that is
+neither a defect of KVM nor of the guest.
+
+For reason code 0x0001 while the configuration is in the mode, print a
+rate-limited message that names the cause instead and fail KVM_RUN with
+-EINVAL as before. Every other validity interception keeps the warning.
+
+The refusal cannot be detected before SIE is entered: no facility or SCLP
+indication tells whether the levels below run such state descriptions.
+
+No functional change as long as no vCPU is in the mode.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ arch/s390/kvm/s390/intercept.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/arch/s390/kvm/s390/intercept.c b/arch/s390/kvm/s390/intercept.c
+index a87aeb3af0fa..038d2b4ca197 100644
+--- a/arch/s390/kvm/s390/intercept.c
++++ b/arch/s390/kvm/s390/intercept.c
+@@ -8,6 +8,8 @@
+  *               Christian Borntraeger <borntraeger@de.ibm.com>
+  */
+ 
++#define pr_fmt(fmt) "kvm-s390: " fmt
++
+ #include <linux/kvm_host.h>
+ #include <linux/errno.h>
+ #include <linux/pagemap.h>
+@@ -98,6 +100,18 @@ static int handle_validity(struct kvm_vcpu *vcpu)
+ 	KVM_EVENT(3, "validity intercept 0x%x for pid %u (kvm 0x%p)", viwhy,
+ 		  current->pid, vcpu->kvm);
+ 
++	/*
++	 * A machine or hypervisor that does not run state descriptions in the
++	 * ESA/390 format refuses them with reason code 0x0001. User space
++	 * asked for the ESA/390-compatibility mode: report it, but do not
++	 * treat it as a defect of KVM.
++	 */
++	if (viwhy == 0x0001 && kvm_s390_vcpu_is_esa(vcpu)) {
++		pr_warn_ratelimited("ESA/390-compatibility mode not available, validity intercept 0x1 for pid %d\n",
++				    current->pid);
++		return -EINVAL;
++	}
++
+ 	/* do not warn on invalid runtime instrumentation mode */
+ 	WARN_ONCE(viwhy != 0x44, "kvm: unhandled validity intercept 0x%x\n",
+ 		  viwhy);
+-- 
+2.47.3
+

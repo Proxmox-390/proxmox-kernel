@@ -1,0 +1,1406 @@
+From 0b930c2cc28a3db03009bbbfa69f470b563b781d Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
+Date: Thu, 26 Nov 2026 11:05:16 +0100
+Subject: [RFC PATCH 2/4] KVM: s390: Run ESA/390 DAT-on code on shadow address
+ spaces
+
+The ESA/390-compatibility mode has no dynamic address translation. While
+the PSW of a vCPU in the mode has the DAT bit, run the vCPU with DAT off on
+an ESA/390 shadow gmap instead of the VM's gmap. The PSW given to SIE lacks
+the DAT bit and the interruption masks, so the machine presents no
+interruption itself; KVM presents them, and kicks the vCPU out of SIE when
+one becomes pending. SIGP orders are not interpreted by the machine for
+such a VM, so that their interruptions take the same path.
+
+Intercept what would show the substitution or apply real addresses to
+the shadow: program interruptions, SVC, LPSW, SSM, STOSM, STNSM, LCTL of
+control registers 0, 1, 6 and 14, the storage-key instructions and
+TPROT. Emulate LOAD REAL ADDRESS and the purges (IPTE, CSP, PTLB, PALB)
+also with DAT off. LPSW accepts a wait PSW with an odd instruction
+address, which is recognized only when an instruction is fetched. IPTE
+and the purge of CSP take effect on all vCPUs before the instruction
+completes: the shadow entries are removed, and vCPUs running on a
+dropped shadow are kicked out of SIE first.
+
+The primary and the home space are provided. SET ADDRESS SPACE CONTROL
+(FAST) and INSERT ADDRESS SPACE CONTROL arrive as special-operation
+exceptions and are emulated, including the space-switch event.
+
+SIE needs the prefix page of the address space it runs on, which in the
+shadow is virtual page 0. While the guest's tables do not translate that
+page, a page of the vCPU stands in for it. Stores to its first 512 bytes
+are caught with low-address protection given to SIE and presented as the
+translation exception the guest's tables call for; other stores, as the
+change bit shows them, fail KVM_RUN.
+
+KVM_RUN also fails with -EOPNOTSUPP while the PSW has the DAT bit and the
+secondary space or access-register mode is selected, or branch or ASN
+tracing is enabled. Explicit tracing is taken out of control register 12
+for SIE: TRACE records nothing while translated.
+
+Nothing enables this yet.
+---
+ arch/s390/include/asm/kvm_host_s390.h       |   2 +
+ arch/s390/include/asm/kvm_host_s390_types.h |   8 +
+ arch/s390/kvm/gmap/gmap.c                   |  14 +-
+ arch/s390/kvm/gmap/gmap.h                   |   1 +
+ arch/s390/kvm/s390/Makefile                 |   2 +-
+ arch/s390/kvm/s390/esa390-dat.c             | 906 ++++++++++++++++++++
+ arch/s390/kvm/s390/intercept.c              |  29 +
+ arch/s390/kvm/s390/interrupt.c              |  18 +
+ arch/s390/kvm/s390/priv.c                   |  26 +-
+ arch/s390/kvm/s390/s390.c                   |  37 +-
+ arch/s390/kvm/s390/s390.h                   |  21 +
+ 11 files changed, 1053 insertions(+), 11 deletions(-)
+ create mode 100644 arch/s390/kvm/s390/esa390-dat.c
+
+diff --git a/arch/s390/include/asm/kvm_host_s390.h b/arch/s390/include/asm/kvm_host_s390.h
+index 4b182286408e..e12a2e7f61f4 100644
+--- a/arch/s390/include/asm/kvm_host_s390.h
++++ b/arch/s390/include/asm/kvm_host_s390.h
+@@ -389,6 +389,8 @@ struct kvm_vcpu_arch {
+ 	struct kvm_s390_pv_vcpu pv;
+ 	union diag318_info diag318_info;
+ 	struct kvm_s390_mmu_cache *mc;
++	struct kvm_s390_esa390_dat *esa390_dat;
++	bool esa390_translated;
+ };
+ 
+ struct kvm_vm_stat {
+diff --git a/arch/s390/include/asm/kvm_host_s390_types.h b/arch/s390/include/asm/kvm_host_s390_types.h
+index 9e348a530421..a21c25157970 100644
+--- a/arch/s390/include/asm/kvm_host_s390_types.h
++++ b/arch/s390/include/asm/kvm_host_s390_types.h
+@@ -158,19 +158,27 @@ struct kvm_s390_sie_block {
+ 	__u64	cputm;			/* 0x0028 */
+ 	__u64	ckc;			/* 0x0030 */
+ 	__u64	epoch;			/* 0x0038 */
++#define SVCC_ALL	0x80000000
+ 	__u32	svcc;			/* 0x0040 */
+ #define LCTL_CR0	0x8000
++#define LCTL_CR1	0x4000
+ #define LCTL_CR6	0x0200
+ #define LCTL_CR9	0x0040
+ #define LCTL_CR10	0x0020
+ #define LCTL_CR11	0x0010
++#define LCTL_CR12	0x0008
+ #define LCTL_CR14	0x0002
+ 	__u16	lctl;			/* 0x0044 */
+ 	__s16	icpua;			/* 0x0046 */
+ #define ICTL_OPEREXC	0x80000000
+ #define ICTL_PINT	0x20000000
++#define ICTL_IPTE	0x01000000
+ #define ICTL_LPSW	0x00400000
++#define ICTL_PTLB	0x00200000	/* and PALB */
++#define ICTL_SSM	0x00100000
+ #define ICTL_STCTL	0x00040000
++#define ICTL_STNSM	0x00020000
++#define ICTL_STOSM	0x00010000
+ #define ICTL_ISKE	0x00004000
+ #define ICTL_SSKE	0x00002000
+ #define ICTL_RRBE	0x00001000
+diff --git a/arch/s390/kvm/gmap/gmap.c b/arch/s390/kvm/gmap/gmap.c
+index fb4befdd88ed..ff9e320d9551 100644
+--- a/arch/s390/kvm/gmap/gmap.c
++++ b/arch/s390/kvm/gmap/gmap.c
+@@ -1147,6 +1147,14 @@ void _gmap_set_cmma_all(struct gmap *gmap, bool dirty)
+ }
+ #endif /* KVM_S390_MANAGES_S390_GUEST */
+ 
++static void gmap_shadow_notifier(struct gmap *sg, gpa_t start, gpa_t end)
++{
++	if (is_esa390_shadow(sg))
++		kvm_s390_esa390_dat_notifier(sg, start, end);
++	else
++		kvm_s390_vsie_gmap_notifier(sg, start, end);
++}
++
+ static void gmap_unshadow_level(struct gmap *sg, gfn_t r_gfn, int level)
+ {
+ 	unsigned long align = PAGE_SIZE;
+@@ -1157,7 +1165,7 @@ static void gmap_unshadow_level(struct gmap *sg, gfn_t r_gfn, int level)
+ 
+ 	if (level > TABLE_TYPE_PAGE_TABLE)
+ 		align = 1UL << (11 * level + _SEGMENT_SHIFT);
+-	kvm_s390_vsie_gmap_notifier(sg, ALIGN_DOWN(gaddr, align), ALIGN(gaddr + 1, align));
++	gmap_shadow_notifier(sg, ALIGN_DOWN(gaddr, align), ALIGN(gaddr + 1, align));
+ 	sg->invalidated = true;
+ 	if (dat_entry_walk(NULL, r_gfn, sg->asce, 0, level, &crstep, &ptep))
+ 		return;
+@@ -1176,7 +1184,7 @@ static void gmap_unshadow_level(struct gmap *sg, gfn_t r_gfn, int level)
+ 		dat_free_level(dereference_crste(crste), true);
+ }
+ 
+-static void gmap_unshadow(struct gmap *sg)
++void gmap_unshadow(struct gmap *sg)
+ {
+ 	struct gmap_cache *gmap_cache, *next;
+ 
+@@ -1186,7 +1194,7 @@ static void gmap_unshadow(struct gmap *sg)
+ 	lockdep_assert_held(&sg->parent->children_lock);
+ 
+ 	gmap_remove_child(sg);
+-	kvm_s390_vsie_gmap_notifier(sg, 0, -1UL);
++	gmap_shadow_notifier(sg, 0, -1UL);
+ 
+ 	list_for_each_entry_safe(gmap_cache, next, &sg->scb_users, list) {
+ 		gmap_cache->gmap = NULL;
+diff --git a/arch/s390/kvm/gmap/gmap.h b/arch/s390/kvm/gmap/gmap.h
+index c91b5d3c5426..0b51ae57ba85 100644
+--- a/arch/s390/kvm/gmap/gmap.h
++++ b/arch/s390/kvm/gmap/gmap.h
+@@ -109,6 +109,7 @@ struct gmap *gmap_new(struct kvm *kvm, gfn_t limit);
+ struct gmap *gmap_new_child(struct gmap *parent, gfn_t limit);
+ void gmap_remove_child(struct gmap *child);
+ void gmap_dispose(struct gmap *gmap);
++void gmap_unshadow(struct gmap *sg);
+ int gmap_link(struct kvm_s390_mmu_cache *mc, struct gmap *gmap, struct guest_fault *fault,
+ 	      struct kvm_memory_slot *slot);
+ void gmap_sync_dirty_log(struct gmap *gmap, gfn_t start, gfn_t end);
+diff --git a/arch/s390/kvm/s390/Makefile b/arch/s390/kvm/s390/Makefile
+index 762a63826423..4a9d7ab26114 100644
+--- a/arch/s390/kvm/s390/Makefile
++++ b/arch/s390/kvm/s390/Makefile
+@@ -7,7 +7,7 @@ include $(srctree)/arch/s390/kvm/gmap/Makefile
+ ccflags-y := -I$(src) -I$(srctree)/arch/s390/kvm/gmap
+ 
+ kvm-y += s390.o intercept.o interrupt.o priv.o sigp.o
+-kvm-y += diag.o gaccess.o guestdbg.o vsie.o pv.o
++kvm-y += diag.o gaccess.o guestdbg.o vsie.o pv.o esa390-dat.o
+ kvm-y += $(gmap-y)
+ 
+ kvm-$(CONFIG_VFIO_PCI_ZDEV_KVM) += pci.o
+diff --git a/arch/s390/kvm/s390/esa390-dat.c b/arch/s390/kvm/s390/esa390-dat.c
+new file mode 100644
+index 000000000000..68b21e3590c9
+--- /dev/null
++++ b/arch/s390/kvm/s390/esa390-dat.c
+@@ -0,0 +1,906 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * ESA/390 DAT shadowing for the ESA/390-compatibility mode
++ *
++ * The machine provides no dynamic address translation in the mode. While
++ * the PSW of a vCPU has the DAT bit, the vCPU runs with DAT off on a shadow
++ * gmap whose addresses are the virtual addresses of the guest (see
++ * gmap_create_esa390_shadow()). The PSW given to SIE lacks the DAT bit and
++ * the interruption masks, so that the machine presents no interruption
++ * itself; everything that would show the difference is intercepted.
++ */
++
++#include <linux/kvm_host.h>
++#include <linux/hrtimer.h>
++#include <linux/slab.h>
++#include <asm/lowcore.h>
++#include <asm/asm-offsets.h>
++#include <asm/dis.h>
++
++#include "s390.h"
++#include "gaccess.h"
++#include "gmap.h"
++#include "dat.h"
++
++/* the ESA/390 shadows a VM keeps, in addition to one per vCPU */
++#define ESA390_DAT_SHADOWS	64
++
++#define ESA390_PSW_SUBST	(PSW_MASK_DAT | PSW_MASK_IO | PSW_MASK_EXT | PSW_MASK_MCHECK)
++
++/*
++ * control register 0: SSM suppression; control register 12: branch and ASN
++ * tracing, explicit tracing
++ */
++#define CR0_SSM_SUPPRESSION	0x40000000UL
++#define CR12_IMPLICIT_TRACING	0x80000002UL
++#define CR12_EXPLICIT_TRACING	0x00000001UL
++
++/**
++ * struct kvm_s390_esa390_dat - ESA/390 DAT shadowing state of a vCPU.
++ * @gc: The shadow of the last translated SIE entry, registered with it.
++ * @sg: Reference to @gc.gmap, held while the vCPU may run on it.
++ * @vcpu: The vCPU.
++ * @psw_bits: The PSW bits taken away for SIE.
++ * @prefix_mapped: The prefix page of @sg is mapped.
++ * @prefix_scratch: It is mapped to @scratch, not the guest's page.
++ * @scratch: The page standing in for an untranslated virtual page 0.
++ * @lap_trap: Low-address protection is given to SIE to catch stores to
++ *	      virtual page 0 while it is @scratch.
++ * @page0_used: The guest stored into @scratch in the last SIE run.
++ * @cr0: The guest's control register 0 while SIE has another.
++ * @explicit_tracing: Taken out of control register 12 for SIE.
++ * @refused: An interception asked for something that is not provided.
++ */
++struct kvm_s390_esa390_dat {
++	struct gmap_cache gc;
++	struct gmap *sg;
++	struct kvm_vcpu *vcpu;
++	struct page *scratch;
++	u64 psw_bits;
++	bool prefix_mapped;
++	bool prefix_scratch;
++	bool lap_trap;
++	bool page0_used;
++	bool refused;
++	bool explicit_tracing;
++	u64 cr0;
++};
++
++static bool translated(struct kvm_vcpu *vcpu)
++{
++	return vcpu->arch.sie_block->gpsw.mask & PSW_MASK_DAT;
++}
++
++/* the segment-table designation of the space the PSW selects: primary or home */
++static u32 esa390_std(struct kvm_vcpu *vcpu)
++{
++	if (psw_bits(vcpu->arch.sie_block->gpsw).as == PSW_BITS_AS_HOME)
++		return vcpu->arch.sie_block->gcr[13];
++	return vcpu->arch.sie_block->gcr[1];
++}
++
++/*
++ * Drop the vCPU's reference. The registration in @gc.gmap->scb_users is
++ * removed by the caller or has been removed by gmap_unshadow().
++ */
++static void esa390_put_shadow(struct kvm_s390_esa390_dat *esa)
++{
++	if (esa->sg)
++		esa->sg = gmap_put(esa->sg);
++	esa->prefix_mapped = false;
++	esa->prefix_scratch = false;
++}
++
++static void esa390_unregister(struct kvm_s390_esa390_dat *esa, struct gmap *parent)
++{
++	scoped_guard(spinlock, &parent->children_lock) {
++		if (esa->gc.gmap) {
++			list_del(&esa->gc.list);
++			esa->gc.gmap = NULL;
++		}
++	}
++	esa390_put_shadow(esa);
++}
++
++/* Make room for one more ESA/390 shadow: drop the least recently used unused one. */
++static void esa390_evict(struct kvm *kvm, struct gmap *parent)
++{
++	unsigned int limit = ESA390_DAT_SHADOWS + atomic_read(&kvm->online_vcpus);
++	struct gmap *sg, *victim = NULL;
++	unsigned int n = 0;
++
++	lockdep_assert_held(&parent->children_lock);
++	list_for_each_entry(sg, &parent->children, list) {
++		if (!is_esa390_shadow(sg))
++			continue;
++		n++;
++		if (list_empty(&sg->scb_users))
++			victim = sg;
++	}
++	if (n < limit || !victim)
++		return;
++	gmap_remove_child(victim);
++	gmap_put(victim);
++}
++
++/* Find or create the shadow for the current STD and prefix. */
++static int esa390_acquire_shadow(struct kvm_vcpu *vcpu, struct kvm_s390_esa390_dat *esa)
++{
++	struct gmap *parent = vcpu->kvm->arch.gmap;
++	u32 std = esa390_std(vcpu) & ESA390_STD_KEY;
++	u32 prefix = kvm_s390_get_prefix(vcpu);
++	struct gmap *sg;
++
++	scoped_guard(spinlock, &parent->children_lock) {
++		sg = esa->gc.gmap;
++		if (sg && esa->sg == sg && gmap_is_esa390_shadow_valid(sg, std, prefix)) {
++			list_move(&sg->list, &parent->children);
++			vcpu->kvm->stat.gmap_shadow_reuse++;
++			return 0;
++		}
++		if (sg) {
++			list_del(&esa->gc.list);
++			esa->gc.gmap = NULL;
++		}
++		esa390_evict(vcpu->kvm, parent);
++	}
++	esa390_put_shadow(esa);
++
++	for (;;) {
++		sg = gmap_create_esa390_shadow(vcpu->arch.mc, parent, std, prefix);
++		if (IS_ERR(sg)) {
++			if (PTR_ERR(sg) == -EAGAIN)
++				continue;
++			return PTR_ERR(sg);
++		}
++		scoped_guard(spinlock, &parent->children_lock) {
++			if (sg->parent) {
++				list_move(&sg->list, &parent->children);
++				list_add(&esa->gc.list, &sg->scb_users);
++				esa->gc.gmap = sg;
++				esa->sg = sg;
++				vcpu->kvm->stat.gmap_shadow_create++;
++				return 0;
++			}
++		}
++		gmap_put(sg);
++	}
++}
++
++/*
++ * SIE needs the prefix page of the address space it runs on. In a shadow,
++ * that is virtual page 0 (real address 0 after prefixing). If the guest's
++ * tables do not translate it, a page of the vCPU stands in for it; the
++ * next entry checks whether the guest has made the page valid meanwhile.
++ * The page is per vCPU, so that its storage key shows this vCPU's use.
++ */
++static int esa390_map_prefix(struct kvm_vcpu *vcpu, struct kvm_s390_esa390_dat *esa)
++{
++	u32 prefix = kvm_s390_get_prefix(vcpu);
++	struct esa390_walk w;
++	int rc;
++
++	if (esa->prefix_mapped && esa->prefix_scratch) {
++		rc = kvm_s390_esa390_walk(vcpu->kvm, esa390_std(vcpu), 0, NULL, &w);
++		if (rc)
++			return rc < 0 ? rc : 0;
++		rc = gaccess_esa390_map_page(vcpu, esa->sg, prefix, NULL);
++		if (rc)
++			return rc;
++		esa->prefix_mapped = false;
++	}
++	if (esa->prefix_mapped)
++		return 0;
++	/*
++	 * A shadow used before may still map the vCPU's page there, which is
++	 * not a translation of the guest: drop whatever is mapped first.
++	 */
++	rc = gaccess_esa390_map_page(vcpu, esa->sg, prefix, NULL);
++	if (rc)
++		return rc;
++	esa->prefix_mapped = true;
++	esa->prefix_scratch = false;
++	rc = gaccess_shadow_fault(vcpu, esa->sg, prefix, NULL, true);
++	if (rc == PGM_SEGMENT_TRANSLATION || rc == PGM_PAGE_TRANSLATION) {
++		rc = -ENOMEM;
++		if (!esa->scratch)
++			esa->scratch = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
++		if (esa->scratch)
++			rc = gaccess_esa390_map_page(vcpu, esa->sg, prefix, esa->scratch);
++		esa->prefix_scratch = !rc;
++	}
++	if (rc) {
++		esa->prefix_mapped = false;
++		if (rc > 0) {
++			VCPU_EVENT(vcpu, 3, "ESA/390 DAT: virtual page 0 unusable (%d)", rc);
++			return -EOPNOTSUPP;
++		}
++	}
++	return rc;
++}
++
++static int esa390_alloc(struct kvm_vcpu *vcpu)
++{
++	struct kvm_s390_esa390_dat *esa;
++
++	if (vcpu->arch.esa390_dat)
++		return 0;
++	esa = kzalloc_obj(*esa, GFP_KERNEL_ACCOUNT);
++	if (!esa)
++		return -ENOMEM;
++	INIT_LIST_HEAD(&esa->gc.list);
++	esa->vcpu = vcpu;
++	vcpu->arch.esa390_dat = esa;
++	return 0;
++}
++
++static void esa390_set_controls(struct kvm_vcpu *vcpu, bool dat)
++{
++	struct kvm_s390_sie_block *scb = vcpu->arch.sie_block;
++	const u32 dat_ictl = ICTL_SSM | ICTL_STOSM | ICTL_STNSM | ICTL_TPROT | ICTL_STCTL;
++
++	/* a PSW with the DAT bit reached by the machine, LRA, the purges */
++	scb->ictl |= ICTL_PINT | ICTL_OPEREXC | ICTL_IPTE | ICTL_PTLB;
++	if (dat) {
++		scb->ictl |= dat_ictl | ICTL_LPSW | ICTL_ISKE | ICTL_SSKE | ICTL_RRBE;
++		scb->lctl |= LCTL_CR0 | LCTL_CR1 | LCTL_CR6 | LCTL_CR12 | LCTL_CR14;
++		scb->svcc = SVCC_ALL;
++		return;
++	}
++	scb->ictl &= ~dat_ictl;
++	if (sclp.has_kss)
++		scb->ictl &= ~(ICTL_ISKE | ICTL_SSKE | ICTL_RRBE);
++	scb->svcc = 0;
++}
++
++/**
++ * kvm_s390_esa390_dat_reset_controls() - Drop the controls of DAT shadowing.
++ * @vcpu: The vCPU, whose architectural mode changes.
++ */
++void kvm_s390_esa390_dat_reset_controls(struct kvm_vcpu *vcpu)
++{
++	struct kvm_s390_sie_block *scb = vcpu->arch.sie_block;
++	struct kvm *kvm = vcpu->kvm;
++
++	if (!kvm->arch.esa390_dat)
++		return;
++	vcpu->arch.esa390_translated = false;
++	scb->ictl &= ~(ICTL_IPTE | ICTL_PTLB | ICTL_SSM | ICTL_STOSM | ICTL_STNSM | ICTL_TPROT);
++	if (!test_kvm_facility(kvm, 74) && !kvm->arch.user_instr0 && !kvm->arch.user_operexec)
++		scb->ictl &= ~ICTL_OPEREXC;
++	scb->svcc = 0;
++}
++
++/**
++ * kvm_s390_esa390_dat_enter() - Prepare the next SIE entry.
++ * @vcpu: The vCPU, in the ESA/390-compatibility mode with DAT shadowing.
++ *
++ * Called after interruptions were delivered and requests handled.
++ *
++ * Return: 0, or a negative error code for KVM_RUN.
++ */
++int kvm_s390_esa390_dat_enter(struct kvm_vcpu *vcpu)
++{
++	struct kvm_s390_esa390_dat *esa;
++	int rc, loops = 0;
++
++again:
++	vcpu->arch.esa390_translated = false;
++	if (!translated(vcpu)) {
++		esa390_set_controls(vcpu, false);
++		return 0;
++	}
++	if (psw_bits(vcpu->arch.sie_block->gpsw).as == PSW_BITS_AS_SECONDARY ||
++	    psw_bits(vcpu->arch.sie_block->gpsw).as == PSW_BITS_AS_ACCREG ||
++	    (vcpu->arch.sie_block->gcr[12] & CR12_IMPLICIT_TRACING))
++		return -EOPNOTSUPP;
++	if (!kvm_s390_esa390_dat_format_valid(vcpu)) {
++		/* recognized when the next instruction is fetched */
++		struct kvm_s390_pgm_info pgm = {
++			.code = PGM_TRANSLATION_SPEC,
++			.flags = KVM_S390_PGM_FLAGS_NO_REWIND,
++		};
++
++		/* a program new PSW with the same problem: interruption loop */
++		if (loops++)
++			return -EOPNOTSUPP;
++		rc = kvm_s390_inject_prog_irq(vcpu, &pgm);
++		if (!rc)
++			rc = kvm_s390_deliver_pending_interrupts(vcpu);
++		if (rc)
++			return rc;
++		goto again;
++	}
++	rc = esa390_alloc(vcpu);
++	if (rc)
++		return rc;
++	esa = vcpu->arch.esa390_dat;
++	do {
++		rc = esa390_acquire_shadow(vcpu, esa);
++		if (!rc)
++			rc = esa390_map_prefix(vcpu, esa);
++	} while (rc == -EAGAIN);
++	if (rc)
++		return rc;
++	/*
++	 * While @scratch stands in for virtual page 0, stores to its first
++	 * 512 bytes are caught with low-address protection, unless the guest
++	 * uses that itself or it does not apply (private space). Other stores
++	 * show in the change bit of the page.
++	 */
++	esa->lap_trap = esa->prefix_scratch &&
++			!(vcpu->arch.sie_block->gcr[0] & CR0_LOW_ADDRESS_PROTECTION) &&
++			!(esa390_std(vcpu) & ESA390_STD_P);
++	if (esa->prefix_scratch)
++		page_set_storage_key(page_to_phys(esa->scratch), 0, 0);
++	esa390_set_controls(vcpu, true);
++	WRITE_ONCE(vcpu->arch.esa390_translated, true);
++	kvm_s390_esa390_dat_arm_timer(vcpu);
++	return 0;
++}
++
++/**
++ * kvm_s390_esa390_dat_sie_asce() - Substitute the state for SIE.
++ * @vcpu: The vCPU.
++ * @asce: The ASCE SIE would use.
++ *
++ * Context: Right before SIE, interrupts disabled.
++ *
++ * Return: The ASCE SIE has to use.
++ */
++unsigned long kvm_s390_esa390_dat_sie_asce(struct kvm_vcpu *vcpu, unsigned long asce)
++{
++	struct kvm_s390_esa390_dat *esa = vcpu->arch.esa390_dat;
++	psw_t *psw = &vcpu->arch.sie_block->gpsw;
++
++	if (!vcpu->arch.esa390_translated)
++		return asce;
++	esa->psw_bits = psw->mask & ESA390_PSW_SUBST;
++	psw->mask &= ~ESA390_PSW_SUBST;
++	/*
++	 * Trace entries are stored at real addresses, which SIE would apply to
++	 * the shadow: TRACE records nothing while translated.
++	 */
++	esa->explicit_tracing = vcpu->arch.sie_block->gcr[12] & CR12_EXPLICIT_TRACING;
++	vcpu->arch.sie_block->gcr[12] &= ~CR12_EXPLICIT_TRACING;
++	if (esa->lap_trap) {
++		esa->cr0 = vcpu->arch.sie_block->gcr[0];
++		vcpu->arch.sie_block->gcr[0] |= CR0_LOW_ADDRESS_PROTECTION;
++	}
++	return esa->sg->asce.val;
++}
++
++/**
++ * kvm_s390_esa390_dat_sie_exit() - Undo the substitution after SIE.
++ * @vcpu: The vCPU.
++ */
++void kvm_s390_esa390_dat_sie_exit(struct kvm_vcpu *vcpu)
++{
++	struct kvm_s390_esa390_dat *esa = vcpu->arch.esa390_dat;
++
++	if (!vcpu->arch.esa390_translated)
++		return;
++	vcpu->arch.sie_block->gpsw.mask |= esa->psw_bits;
++	if (esa->lap_trap)
++		vcpu->arch.sie_block->gcr[0] = esa->cr0;
++	if (esa->explicit_tracing)
++		vcpu->arch.sie_block->gcr[12] |= CR12_EXPLICIT_TRACING;
++	/* the reference bit also shows SIE's own use of the prefix page */
++	if (esa->prefix_scratch &&
++	    page_get_storage_key(page_to_phys(esa->scratch)) & _PAGE_CHANGED)
++		esa->page0_used = true;
++}
++
++/**
++ * kvm_s390_esa390_dat_post_run() - Check the last translated SIE run.
++ * @vcpu: The vCPU.
++ *
++ * Return: -EOPNOTSUPP if the guest used the page standing in for an
++ * untranslated virtual page 0 in a way that was not caught, else 0.
++ */
++int kvm_s390_esa390_dat_post_run(struct kvm_vcpu *vcpu)
++{
++	struct kvm_s390_esa390_dat *esa = vcpu->arch.esa390_dat;
++
++	if (!vcpu->arch.esa390_translated || !esa->page0_used)
++		return 0;
++	esa->page0_used = false;
++	VCPU_EVENT(vcpu, 3, "%s", "ESA/390 DAT: untranslated virtual page 0 used");
++	return -EOPNOTSUPP;
++}
++
++/*
++ * Something the guest does is not provided. Interception handlers cannot
++ * fail KVM_RUN themselves (-EOPNOTSUPP hands the interception to user
++ * space); the next entry does it.
++ */
++static int esa390_refuse(struct kvm_vcpu *vcpu)
++{
++	vcpu->arch.esa390_dat->refused = true;
++	return 1;
++}
++
++/**
++ * kvm_s390_esa390_dat_check() - Fail KVM_RUN after a refusal.
++ * @vcpu: The vCPU.
++ *
++ * Return: -EOPNOTSUPP if the last interception was refused, else 0.
++ */
++int kvm_s390_esa390_dat_check(struct kvm_vcpu *vcpu)
++{
++	struct kvm_s390_esa390_dat *esa = vcpu->arch.esa390_dat;
++
++	if (!esa || !esa->refused)
++		return 0;
++	esa->refused = false;
++	VCPU_EVENT(vcpu, 3, "%s", "ESA/390 DAT: refused");
++	return -EOPNOTSUPP;
++}
++
++/*
++ * SET ADDRESS SPACE CONTROL (FAST) between primary and home space, and
++ * INSERT ADDRESS SPACE CONTROL. The machine, which runs the vCPU with DAT
++ * off, recognizes a special-operation exception for them. Any other
++ * instruction that needs DAT is not provided.
++ */
++static int esa390_special_op(struct kvm_vcpu *vcpu)
++{
++	struct kvm_s390_sie_block *scb = vcpu->arch.sie_block;
++	u64 *gprs = vcpu->run->s.regs.gprs;
++	struct kvm_s390_pgm_info pgm = {};
++	int ilen = kvm_s390_get_ilen(vcpu);
++	u8 insn[4], old_as, as;
++	bool home, was_home;
++	u32 code, sse;
++	int rc;
++
++	if (ilen != 4)
++		return esa390_refuse(vcpu);
++	rc = read_guest_instr(vcpu, scb->gpsw.addr - 4, insn, 4);
++	if (rc)
++		return rc < 0 ? rc : esa390_refuse(vcpu);
++	old_as = psw_bits(scb->gpsw).as;
++	if (insn[0] == 0xb2 && insn[1] == 0x24) {
++		/* IAC */
++		if ((scb->gpsw.mask & PSW_MASK_PSTATE) && !(scb->gcr[0] & 0x08000000))
++			return kvm_s390_inject_program_int(vcpu, PGM_PRIVILEGED_OP) ?: 1;
++		as = (old_as >> 1 | old_as << 1) & 3;
++		gprs[insn[3] >> 4] &= ~0xff00UL;
++		gprs[insn[3] >> 4] |= as << 8;
++		kvm_s390_set_psw_cc(vcpu, old_as == PSW_BITS_AS_SECONDARY ? 1 :
++				    old_as == PSW_BITS_AS_ACCREG ? 2 : old_as);
++		return 1;
++	}
++	if (!(insn[0] == 0xb2 && (insn[1] == 0x19 || insn[1] == 0x79)))
++		return esa390_refuse(vcpu);
++	/* SAC, SACF: bits 20-23 of the second-operand address */
++	code = ((insn[2] & 0xf) << 8 | insn[3]) + (insn[2] >> 4 ? gprs[insn[2] >> 4] : 0);
++	code = code >> 8 & 0xf;
++	if (insn[1] == 0x19 && !(scb->gcr[0] & 0x04000000))
++		return kvm_s390_inject_program_int(vcpu, PGM_SPECIAL_OPERATION) ?: 1;
++	if (code == 3 && (scb->gpsw.mask & PSW_MASK_PSTATE))
++		return kvm_s390_inject_program_int(vcpu, PGM_PRIVILEGED_OP) ?: 1;
++	if (code == 2 && !(scb->gcr[0] & 0x00010000))
++		return kvm_s390_inject_program_int(vcpu, PGM_SPECIAL_OPERATION) ?: 1;
++	if (code > 3)
++		return kvm_s390_inject_program_int(vcpu, PGM_SPECIFICATION) ?: 1;
++	/* only the primary and the home space are provided while translated */
++	if (code == 1 || code == 2)
++		return esa390_refuse(vcpu);
++	as = code == 3 ? PSW_BITS_AS_HOME : PSW_BITS_AS_PRIMARY;
++	scb->gpsw.mask &= ~PSW_MASK_ASC;
++	scb->gpsw.mask |= (u64)as << 46;
++	home = as == PSW_BITS_AS_HOME;
++	was_home = old_as == PSW_BITS_AS_HOME;
++	if (home == was_home)
++		return 1;
++	sse = home ? scb->gcr[1] : scb->gcr[13];
++	if (!((scb->gcr[1] | scb->gcr[13]) & 0x80000000))
++		return 1;
++	/* space-switch event, after completion */
++	pgm.code = PGM_SPACE_SWITCH;
++	pgm.trans_exc_code = (sse & 0x80000000) |
++			     (home ? (u16)scb->gcr[4] : 0);
++	pgm.flags = 4 | KVM_S390_PGM_FLAGS_ILC_VALID;
++	rc = kvm_s390_inject_prog_irq(vcpu, &pgm);
++	return rc ?: 1;
++}
++
++/**
++ * kvm_s390_esa390_dat_prog() - Program interception while translated.
++ * @vcpu: The vCPU.
++ *
++ * A protection exception for virtual page 0 that the guest did not ask for
++ * comes from the low-address protection given to SIE: present the
++ * translation exception the guest's tables call for instead.
++ *
++ * Return: 1 if handled, 0 if the interruption belongs to the guest, or a
++ * negative error code.
++ */
++int kvm_s390_esa390_dat_prog(struct kvm_vcpu *vcpu)
++{
++	struct kvm_s390_esa390_dat *esa = vcpu->arch.esa390_dat;
++	struct kvm_s390_sie_block *scb = vcpu->arch.sie_block;
++	struct kvm_s390_pgm_info pgm = {};
++	struct esa390_walk w;
++	int ilen, rc;
++
++	if (!vcpu->arch.esa390_translated)
++		return 0;
++	if ((scb->iprcc & ~PGM_PER) == PGM_SPECIAL_OPERATION)
++		return esa390_special_op(vcpu);
++	if (!esa->lap_trap || (scb->iprcc & ~PGM_PER) != PGM_PROTECTION ||
++	    (u32)scb->dxc >= PAGE_SIZE)
++		return 0;
++	rc = kvm_s390_esa390_walk(vcpu->kvm, esa390_std(vcpu), 0, NULL, &w);
++	if (rc <= 0)
++		return rc;
++	ilen = kvm_s390_get_ilen(vcpu);
++	kvm_s390_rewind_psw(vcpu, ilen);
++	pgm.code = rc;
++	if (psw_bits(scb->gpsw).as == PSW_BITS_AS_HOME)
++		pgm.trans_exc_code = 3;
++	pgm.flags = ilen | KVM_S390_PGM_FLAGS_ILC_VALID | KVM_S390_PGM_FLAGS_NO_REWIND;
++	rc = kvm_s390_inject_prog_irq(vcpu, &pgm);
++	return rc ?: 1;
++}
++
++/**
++ * kvm_s390_esa390_dat_notifier() - Part of an ESA/390 shadow is removed.
++ * @sg: The shadow.
++ * @start: First shadow address affected.
++ * @end: Last shadow address affected.
++ *
++ * Users whose prefix page goes away leave SIE before this returns and map
++ * it again before they enter SIE again.
++ */
++void kvm_s390_esa390_dat_notifier(struct gmap *sg, gpa_t start, gpa_t end)
++{
++	struct kvm_s390_esa390_dat *esa;
++	struct gmap_cache *gc;
++
++	if (sg->esa_prefix > end || start >= sg->esa_prefix + PAGE_SIZE)
++		return;
++	list_for_each_entry(gc, &sg->scb_users, list) {
++		esa = container_of(gc, struct kvm_s390_esa390_dat, gc);
++		esa->prefix_mapped = false;
++		kvm_s390_sync_request(KVM_REQ_REFRESH_GUEST_PREFIX, esa->vcpu);
++	}
++}
++
++/**
++ * kvm_s390_esa390_dat_kick() - An interruption may have become pending.
++ * @vcpu: The vCPU.
++ *
++ * While translated, the machine does not see the interruption masks, so it
++ * would not leave SIE to let KVM present the interruption.
++ */
++void kvm_s390_esa390_dat_kick(struct kvm_vcpu *vcpu)
++{
++	if (READ_ONCE(vcpu->arch.esa390_translated))
++		kvm_s390_set_cpuflags(vcpu, CPUSTAT_STOP_INT);
++}
++
++/* Drop the ESA/390 shadows with @prefix, or all of them. */
++static void esa390_purge(struct kvm *kvm, u32 prefix, bool all)
++{
++	struct gmap *parent = kvm->arch.gmap;
++	struct gmap *sg, *next;
++
++	guard(read_lock)(&kvm->mmu_lock);
++	guard(spinlock)(&parent->children_lock);
++	list_for_each_entry_safe(sg, next, &parent->children, list) {
++		if (is_esa390_shadow(sg) && (all || sg->esa_prefix == prefix))
++			gmap_unshadow(sg);
++	}
++}
++
++/**
++ * kvm_s390_esa390_dat_release() - Drop all ESA/390 shadows of a VM.
++ * @kvm: The VM.
++ */
++void kvm_s390_esa390_dat_release(struct kvm *kvm)
++{
++	if (kvm->arch.esa390_dat && kvm->arch.gmap)
++		esa390_purge(kvm, 0, true);
++}
++
++/**
++ * kvm_s390_esa390_dat_vcpu_destroy() - Free the vCPU's state.
++ * @vcpu: The vCPU.
++ */
++void kvm_s390_esa390_dat_vcpu_destroy(struct kvm_vcpu *vcpu)
++{
++	struct kvm_s390_esa390_dat *esa = vcpu->arch.esa390_dat;
++
++	if (!esa)
++		return;
++	esa390_unregister(esa, vcpu->kvm->arch.gmap);
++	if (esa->scratch)
++		__free_page(esa->scratch);
++	kfree(esa);
++	vcpu->arch.esa390_dat = NULL;
++}
++
++/**
++ * kvm_s390_esa390_dat_fault() - Handle a host fault on the shadow.
++ * @vcpu: The vCPU, translated.
++ *
++ * Return: 0 to enter SIE again, or a negative error code.
++ */
++int kvm_s390_esa390_dat_fault(struct kvm_vcpu *vcpu)
++{
++	struct kvm_s390_esa390_dat *esa = vcpu->arch.esa390_dat;
++	unsigned long saddr = current->thread.gmap_teid.addr * PAGE_SIZE;
++	struct kvm_s390_pgm_info pgm = {};
++	u32 va;
++	u8 opcode;
++	int rc, ilen;
++
++	switch (current->thread.gmap_int_code & PGM_INT_CODE_MASK) {
++	case 0:
++		vcpu->stat.exit_null++;
++		return 0;
++	case PGM_PROTECTION:
++	case PGM_SEGMENT_TRANSLATION:
++	case PGM_PAGE_TRANSLATION:
++	case PGM_ASCE_TYPE:
++	case PGM_REGION_FIRST_TRANS:
++	case PGM_REGION_SECOND_TRANS:
++	case PGM_REGION_THIRD_TRANS:
++		break;
++	default:
++		KVM_BUG(1, vcpu->kvm, "Unexpected program interrupt 0x%x, TEID 0x%016lx",
++			current->thread.gmap_int_code, current->thread.gmap_teid.val);
++		return -EFAULT;
++	}
++
++	rc = gaccess_shadow_fault(vcpu, esa->sg, saddr, NULL, kvm_s390_cur_gmap_fault_is_write());
++	if (rc == -EAGAIN)
++		return 0;
++	if (rc <= 0)
++		return rc;
++
++	va = _kvm_s390_real_to_abs_esa(esa->sg->esa_prefix, saddr);
++	pgm.code = rc;
++	pgm.trans_exc_code = va;
++	if (psw_bits(vcpu->arch.sie_block->gpsw).as == PSW_BITS_AS_HOME)
++		pgm.trans_exc_code |= 3;
++	/* the length of the instruction, unless it cannot be fetched */
++	ilen = 4;
++	rc = read_guest_instr(vcpu, vcpu->arch.sie_block->gpsw.addr, &opcode, 1);
++	if (rc < 0)
++		return rc;
++	if (!rc)
++		ilen = insn_length(opcode);
++	pgm.flags = ilen | KVM_S390_PGM_FLAGS_ILC_VALID;
++	switch (pgm.code) {
++	case PGM_SEGMENT_TRANSLATION:
++	case PGM_PAGE_TRANSLATION:
++		pgm.flags |= KVM_S390_PGM_FLAGS_NO_REWIND;
++		break;
++	case PGM_PROTECTION:
++		/* suppression on protection: bit 29 */
++		pgm.trans_exc_code |= 0x4;
++		fallthrough;
++	default:
++		kvm_s390_forward_psw(vcpu, ilen);
++	}
++	return kvm_s390_inject_prog_irq(vcpu, &pgm);
++}
++
++/**
++ * kvm_s390_esa390_dat_validity() - Validity interception while translated.
++ * @vcpu: The vCPU.
++ * @viwhy: The reason code.
++ *
++ * Return: true if it was handled.
++ */
++bool kvm_s390_esa390_dat_validity(struct kvm_vcpu *vcpu, u16 viwhy)
++{
++	/* the prefix page was taken away between mapping and entry */
++	if (!vcpu->arch.esa390_translated || viwhy != 0x0037)
++		return false;
++	vcpu->arch.esa390_dat->prefix_mapped = false;
++	return true;
++}
++
++/* SET SYSTEM MASK, STORE THEN AND / OR SYSTEM MASK */
++int kvm_s390_esa390_dat_handle_sysmask(struct kvm_vcpu *vcpu)
++{
++	psw_t *psw = &vcpu->arch.sie_block->gpsw;
++	u8 op = vcpu->arch.sie_block->ipa >> 8;
++	u8 i2 = vcpu->arch.sie_block->ipa;
++	u8 mask = psw->mask >> 56;
++	u64 ga;
++	u8 ar;
++	int rc;
++
++	if (psw->mask & PSW_MASK_PSTATE)
++		return kvm_s390_inject_program_int(vcpu, PGM_PRIVILEGED_OP);
++	ga = kvm_s390_get_base_disp_s(vcpu, &ar);
++	if (op == 0x80) {
++		if (vcpu->arch.sie_block->gcr[0] & CR0_SSM_SUPPRESSION)
++			return kvm_s390_inject_program_int(vcpu, PGM_SPECIAL_OPERATION);
++		rc = read_guest(vcpu, ga, ar, &mask, 1);
++	} else {
++		rc = write_guest(vcpu, ga, ar, &mask, 1);
++		mask = op == 0xac ? mask & i2 : mask | i2;
++	}
++	if (rc)
++		return kvm_s390_inject_prog_cond(vcpu, rc);
++	psw->mask = (psw->mask & ~(0xffUL << 56)) | (u64)mask << 56;
++	if (!kvm_s390_is_valid_psw(vcpu, psw))
++		return kvm_s390_inject_program_int(vcpu, PGM_SPECIFICATION);
++	return 0;
++}
++
++/* SUPERVISOR CALL */
++int kvm_s390_esa390_dat_handle_svc(struct kvm_vcpu *vcpu)
++{
++	u16 code = vcpu->arch.sie_block->ipa & 0xff;
++	u32 id = (u32)kvm_s390_get_ilen(vcpu) << 16 | code;
++	int rc;
++
++	rc = put_guest_lc(vcpu, id, (u32 *)offsetof(struct lowcore, svc_int_code));
++	rc |= kvm_s390_lc_store_old_psw(vcpu, __LC_SVC_OLD_PSW);
++	rc |= kvm_s390_lc_load_new_psw(vcpu, __LC_SVC_NEW_PSW);
++	return rc ? -EFAULT : 0;
++}
++
++/* LOAD REAL ADDRESS, an operation exception in the mode */
++int kvm_s390_esa390_dat_handle_lra(struct kvm_vcpu *vcpu)
++{
++	struct kvm_s390_sie_block *scb = vcpu->arch.sie_block;
++	int r1 = (scb->ipa >> 4) & 0xf, x2 = scb->ipa & 0xf, b2 = scb->ipb >> 28;
++	u64 *gprs = vcpu->run->s.regs.gprs;
++	struct esa390_walk w;
++	u32 va, result, std;
++	int rc, cc;
++
++	if (scb->gpsw.mask & PSW_MASK_PSTATE)
++		return kvm_s390_inject_program_int(vcpu, PGM_PRIVILEGED_OP);
++	switch (psw_bits(scb->gpsw).as) {
++	case PSW_BITS_AS_PRIMARY:
++		std = scb->gcr[1];
++		break;
++	case PSW_BITS_AS_SECONDARY:
++		std = scb->gcr[7];
++		break;
++	case PSW_BITS_AS_HOME:
++		std = scb->gcr[13];
++		break;
++	default:
++		/* access-register translation is not provided */
++		esa390_refuse(vcpu);
++		return 0;
++	}
++	va = (scb->ipb >> 16) & 0xfff;
++	va += (x2 ? gprs[x2] : 0) + (b2 ? gprs[b2] : 0);
++	va = kvm_s390_logical_to_effective(vcpu, va);
++	if (!kvm_s390_esa390_dat_format_valid(vcpu))
++		return kvm_s390_inject_program_int(vcpu, PGM_TRANSLATION_SPEC);
++
++	rc = kvm_s390_esa390_walk(vcpu->kvm, std, va, NULL, &w);
++	switch (rc) {
++	case 0:
++		result = w.ra;
++		cc = 0;
++		break;
++	case PGM_SEGMENT_TRANSLATION:
++		result = w.entry;
++		cc = w.len ? 3 : 1;
++		break;
++	case PGM_PAGE_TRANSLATION:
++		result = w.entry;
++		cc = w.len ? 3 : 2;
++		break;
++	default:
++		return rc < 0 ? rc : kvm_s390_inject_program_int(vcpu, rc);
++	}
++	gprs[r1] = (gprs[r1] & ~0xffffffffUL) | result;
++	kvm_s390_set_psw_cc(vcpu, cc);
++	return 0;
++}
++
++/* INVALIDATE PAGE TABLE ENTRY */
++static int esa390_handle_ipte(struct kvm_vcpu *vcpu)
++{
++	u8 key = psw_bits(vcpu->arch.sie_block->gpsw).key;
++	struct kvm *kvm = vcpu->kvm;
++	u32 pto, px, gpa;
++	int r1, r2, rc;
++	u8 byte;
++
++	kvm_s390_get_regs_rre(vcpu, &r1, &r2);
++	pto = vcpu->run->s.regs.gprs[r1] & 0x7fffffc0;
++	px = (vcpu->run->s.regs.gprs[r2] >> 12) & 0xff;
++	gpa = (pto + px * 4) & 0x7fffffff;
++	rc = kvm_s390_check_low_addr_prot_real(vcpu, gpa);
++	if (rc)
++		return kvm_s390_inject_prog_cond(vcpu, rc);
++
++	ipte_lock(kvm);
++	/* the invalid bit is in the third byte of the entry */
++	rc = access_guest_abs_with_key(kvm, gpa + 2, &byte, 1, GACC_FETCH, key);
++	if (!rc) {
++		byte |= 0x04;
++		rc = access_guest_abs_with_key(kvm, gpa + 2, &byte, 1, GACC_STORE, key);
++	}
++	if (!rc) {
++		guard(read_lock)(&kvm->mmu_lock);
++		gmap_handle_vsie_unshadow_event(kvm->arch.gmap, gpa_to_gfn(gpa));
++	}
++	ipte_unlock(kvm);
++	if (rc > 0)
++		return kvm_s390_inject_program_int(vcpu, rc);
++	return rc;
++}
++
++/* COMPARE AND SWAP AND PURGE */
++static int esa390_handle_csp(struct kvm_vcpu *vcpu)
++{
++	u8 key = psw_bits(vcpu->arch.sie_block->gpsw).key;
++	u64 *gprs = vcpu->run->s.regs.gprs;
++	union kvm_s390_quad old, new;
++	unsigned long ga, gpa;
++	bool success;
++	int r1, r2, rc;
++
++	kvm_s390_get_regs_rre(vcpu, &r1, &r2);
++	if (r1 & 1)
++		return kvm_s390_inject_program_int(vcpu, PGM_SPECIFICATION);
++	ga = kvm_s390_logical_to_effective(vcpu, gprs[r2] & ~3UL);
++	rc = guest_translate_address_with_key(vcpu, ga, 0, &gpa, GACC_STORE, key);
++	if (rc)
++		return kvm_s390_inject_prog_cond(vcpu, rc);
++	old.sixteen = 0;
++	old.four = gprs[r1];
++	new.four = gprs[r1 + 1];
++	ipte_lock(vcpu->kvm);
++	rc = cmpxchg_guest_abs_with_key(vcpu->kvm, gpa, 4, &old, new, key, &success);
++	ipte_unlock(vcpu->kvm);
++	if (rc > 0)
++		return kvm_s390_inject_program_int(vcpu, rc);
++	if (rc)
++		return rc;
++	if (!success) {
++		gprs[r1] = (gprs[r1] & ~0xffffffffUL) | old.four;
++		kvm_s390_set_psw_cc(vcpu, 1);
++		return 0;
++	}
++	if (gprs[r2] & 1)
++		esa390_purge(vcpu->kvm, 0, true);
++	kvm_s390_set_psw_cc(vcpu, 0);
++	return 0;
++}
++
++/**
++ * kvm_s390_esa390_dat_handle_b2() - IPTE, CSP, PTLB and PALB with DAT shadowing.
++ * @vcpu: The vCPU.
++ *
++ * Return: -EOPNOTSUPP if the instruction is not one of them.
++ */
++int kvm_s390_esa390_dat_handle_b2(struct kvm_vcpu *vcpu)
++{
++	u8 op = vcpu->arch.sie_block->ipa & 0xff;
++
++	if (op != 0x0d && op != 0x21 && op != 0x48 && op != 0x50)
++		return -EOPNOTSUPP;
++	if (vcpu->arch.sie_block->gpsw.mask & PSW_MASK_PSTATE)
++		return kvm_s390_inject_program_int(vcpu, PGM_PRIVILEGED_OP);
++	switch (op) {
++	case 0x48:
++		/* no access-register translation, nothing to purge */
++		return 0;
++	case 0x0d:
++		esa390_purge(vcpu->kvm, kvm_s390_get_prefix(vcpu), false);
++		return 0;
++	case 0x21:
++		if (!kvm_s390_esa390_dat_format_valid(vcpu))
++			return kvm_s390_inject_program_int(vcpu, PGM_TRANSLATION_SPEC);
++		return esa390_handle_ipte(vcpu);
++	default:
++		return esa390_handle_csp(vcpu);
++	}
++}
+diff --git a/arch/s390/kvm/s390/intercept.c b/arch/s390/kvm/s390/intercept.c
+index 038d2b4ca197..2f7ae0d2b004 100644
+--- a/arch/s390/kvm/s390/intercept.c
++++ b/arch/s390/kvm/s390/intercept.c
+@@ -106,6 +106,9 @@ static int handle_validity(struct kvm_vcpu *vcpu)
+ 	 * asked for the ESA/390-compatibility mode: report it, but do not
+ 	 * treat it as a defect of KVM.
+ 	 */
++	if (kvm_s390_esa390_dat_validity(vcpu, viwhy))
++		return 0;
++
+ 	if (viwhy == 0x0001 && kvm_s390_vcpu_is_esa(vcpu)) {
+ 		pr_warn_ratelimited("ESA/390-compatibility mode not available, validity intercept 0x1 for pid %d\n",
+ 				    current->pid);
+@@ -128,6 +131,16 @@ static int handle_instruction(struct kvm_vcpu *vcpu)
+ 	switch (vcpu->arch.sie_block->ipa >> 8) {
+ 	case 0x01:
+ 		return kvm_s390_handle_01(vcpu);
++	case 0x0a:
++		if (vcpu->arch.esa390_translated)
++			return kvm_s390_esa390_dat_handle_svc(vcpu);
++		return -EOPNOTSUPP;
++	case 0x80:
++	case 0xac:
++	case 0xad:
++		if (vcpu->arch.esa390_translated)
++			return kvm_s390_esa390_dat_handle_sysmask(vcpu);
++		return -EOPNOTSUPP;
+ 	case 0x82:
+ 		return kvm_s390_handle_lpsw(vcpu);
+ 	case 0x83:
+@@ -294,6 +307,19 @@ static int handle_prog(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	trace_kvm_s390_intercept_prog(vcpu, vcpu->arch.sie_block->iprcc);
++	rc = kvm_s390_esa390_dat_prog(vcpu);
++	if (rc)
++		return rc < 0 ? rc : 0;
++	/*
++	 * ESA/390 DAT shadowing: the machine refuses a PSW with the DAT bit
++	 * that it was given by the guest. Nothing has been stored yet; the
++	 * next entry runs the vCPU on the shadow.
++	 */
++	if (vcpu->arch.sie_block->iprcc == PGM_SPECIFICATION &&
++	    kvm_s390_esa390_dat_enabled(vcpu) && !vcpu->arch.esa390_translated &&
++	    (vcpu->arch.sie_block->gpsw.mask & PSW_MASK_DAT) &&
++	    kvm_s390_is_valid_psw(vcpu, &vcpu->arch.sie_block->gpsw))
++		return 0;
+ 	if (vcpu->arch.sie_block->iprcc == PGM_SPECIFICATION) {
+ 		rc = kvm_s390_lc_read_new_psw(vcpu, __LC_PGM_NEW_PSW, &psw);
+ 		if (rc)
+@@ -504,6 +530,9 @@ static int handle_operexc(struct kvm_vcpu *vcpu)
+ 	if (vcpu->arch.sie_block->ipa == 0xb256)
+ 		return handle_sthyi(vcpu);
+ 
++	if ((vcpu->arch.sie_block->ipa >> 8) == 0xb1 && kvm_s390_esa390_dat_enabled(vcpu))
++		return kvm_s390_esa390_dat_handle_lra(vcpu);
++
+ 	if (vcpu->kvm->arch.user_operexec)
+ 		return -EOPNOTSUPP;
+ 
+diff --git a/arch/s390/kvm/s390/interrupt.c b/arch/s390/kvm/s390/interrupt.c
+index 03a8fb0d75ca..f5535a6cd4c1 100644
+--- a/arch/s390/kvm/s390/interrupt.c
++++ b/arch/s390/kvm/s390/interrupt.c
+@@ -972,6 +972,10 @@ static int __must_check __deliver_prog_esa(struct kvm_vcpu *vcpu,
+ 		rc |= put_guest_lc(vcpu, pgm_info->exc_access_id,
+ 				   (u8 *)__LC_EXC_ACCESS_ID);
+ 		break;
++	case PGM_SPACE_SWITCH:
++		rc = put_guest_lc(vcpu, (u32)pgm_info->trans_exc_code,
++				  (u32 *)ESA_LC_PGM_EXC_ID);
++		break;
+ 	case PGM_SEGMENT_TRANSLATION:
+ 	case PGM_PAGE_TRANSLATION:
+ 		/* ESA/390 DAT shadowing */
+@@ -1454,6 +1458,19 @@ static u64 __calculate_sltime(struct kvm_vcpu *vcpu)
+ 	return sltime;
+ }
+ 
++/*
++ * ESA/390 DAT shadowing: SIE does not see the external-interruption mask,
++ * so the vCPU has to be kicked out of SIE when a timer interruption becomes
++ * pending.
++ */
++void kvm_s390_esa390_dat_arm_timer(struct kvm_vcpu *vcpu)
++{
++	u64 sltime = __calculate_sltime(vcpu);
++
++	if (sltime)
++		hrtimer_start(&vcpu->arch.ckc_timer, sltime, HRTIMER_MODE_REL);
++}
++
+ int kvm_s390_handle_wait(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_s390_gisa_interrupt *gi = &vcpu->kvm->arch.gisa_int;
+@@ -1511,6 +1528,7 @@ void kvm_s390_vcpu_wakeup(struct kvm_vcpu *vcpu)
+ 	 * kick it, so it leaves the SIE to process the request.
+ 	 */
+ 	kvm_s390_vsie_kick(vcpu);
++	kvm_s390_esa390_dat_kick(vcpu);
+ }
+ 
+ enum hrtimer_restart kvm_s390_idle_wakeup(struct hrtimer *timer)
+diff --git a/arch/s390/kvm/s390/priv.c b/arch/s390/kvm/s390/priv.c
+index 9f068529db0f..6c35a421266b 100644
+--- a/arch/s390/kvm/s390/priv.c
++++ b/arch/s390/kvm/s390/priv.c
+@@ -246,7 +246,8 @@ static int try_handle_skey(struct kvm_vcpu *vcpu)
+ 	rc = kvm_s390_skey_check_enable(vcpu);
+ 	if (rc)
+ 		return rc;
+-	if (vcpu->kvm->arch.use_skf) {
++	/* operands are real addresses, SIE would apply them to the shadow */
++	if (vcpu->kvm->arch.use_skf && !vcpu->arch.esa390_translated) {
+ 		/* with storage-key facility, SIE interprets it for us */
+ 		kvm_s390_retry_instr(vcpu);
+ 		VCPU_EVENT(vcpu, 4, "%s", "retrying storage key operation");
+@@ -721,9 +722,20 @@ int is_valid_psw(psw_t *psw)
+  */
+ int kvm_s390_is_valid_psw(struct kvm_vcpu *vcpu, psw_t *psw)
+ {
+-	if (kvm_s390_vcpu_is_esa(vcpu) &&
+-	    (psw->mask & (PSW_MASK_DAT | PSW_MASK_EA)))
++	if (kvm_s390_vcpu_is_esa(vcpu) && (psw->mask & PSW_MASK_EA))
+ 		return 0;
++	if (kvm_s390_vcpu_is_esa(vcpu) && (psw->mask & PSW_MASK_DAT) &&
++	    !vcpu->kvm->arch.esa390_dat)
++		return 0;
++	/*
++	 * An odd instruction address is recognized when an instruction is
++	 * fetched, which a wait PSW never leads to.
++	 */
++	if (kvm_s390_vcpu_is_esa(vcpu) && (psw->mask & PSW_MASK_WAIT)) {
++		psw_t even = { .mask = psw->mask, .addr = psw->addr & ~1UL };
++
++		return is_valid_psw(&even);
++	}
+ 	return is_valid_psw(psw);
+ }
+ 
+@@ -972,6 +984,14 @@ static int handle_stsi(struct kvm_vcpu *vcpu)
+ 
+ int kvm_s390_handle_b2(struct kvm_vcpu *vcpu)
+ {
++	int rc;
++
++	if (kvm_s390_esa390_dat_enabled(vcpu)) {
++		rc = kvm_s390_esa390_dat_handle_b2(vcpu);
++		if (rc != -EOPNOTSUPP)
++			return rc;
++	}
++
+ 	switch (vcpu->arch.sie_block->ipa & 0x00ff) {
+ 	case 0x02:
+ 		return handle_stidp(vcpu);
+diff --git a/arch/s390/kvm/s390/s390.c b/arch/s390/kvm/s390/s390.c
+index 63c4c1a3be57..8c965a2defbe 100644
+--- a/arch/s390/kvm/s390/s390.c
++++ b/arch/s390/kvm/s390/s390.c
+@@ -1526,6 +1526,7 @@ static void kvm_s390_vcpu_set_arch_mode_controls(struct kvm_vcpu *vcpu)
+ 	struct kvm_s390_sie_block *scb = vcpu->arch.sie_block;
+ 
+ 	kvm_s390_clear_cpuflags(vcpu, CPUSTAT_ZARCH | CPUSTAT_GED | CPUSTAT_GED2);
++	kvm_s390_esa390_dat_reset_controls(vcpu);
+ 	scb->ecb &= ~(ECB_TE | ECB_GS);
+ 	scb->ecb3 &= ~ECB3_RI;
+ 	scb->eca &= ~ECA_VX;
+@@ -1576,6 +1577,8 @@ static int kvm_s390_set_arch_mode(struct kvm *kvm, bool esa)
+ 			}
+ 		}
+ 	}
++	if (!esa)
++		kvm_s390_esa390_dat_release(kvm);
+ 	kvm->arch.esa390_cm_active = esa;
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+ 		kvm_s390_vcpu_set_arch_mode_controls(vcpu);
+@@ -3557,6 +3560,7 @@ void kvm_arch_vcpu_destroy(struct kvm_vcpu *vcpu)
+ 	/* We can not hold the vcpu mutex here, we are already dying */
+ 	if (kvm_s390_pv_cpu_get_handle(vcpu))
+ 		kvm_s390_pv_destroy_cpu(vcpu, &rc, &rrc);
++	kvm_s390_esa390_dat_vcpu_destroy(vcpu);
+ 	free_page((unsigned long)(vcpu->arch.sie_block));
+ 	kvm_s390_free_mmu_cache(vcpu->arch.mc);
+ }
+@@ -3588,6 +3592,7 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
+ 	kvm_s390_destroy_adapters(kvm);
+ 	kvm_s390_clear_float_irqs(kvm);
+ 	kvm_s390_vsie_destroy(kvm);
++	kvm_s390_esa390_dat_release(kvm);
+ 	kvm->arch.gmap = gmap_put(kvm->arch.gmap);
+ 	KVM_EVENT(3, "vm 0x%p destroyed", kvm);
+ }
+@@ -3868,7 +3873,8 @@ static int kvm_s390_vcpu_setup(struct kvm_vcpu *vcpu)
+ 		vcpu->arch.sie_block->eca |= ECA_IB;
+ 	if (sclp.has_siif)
+ 		vcpu->arch.sie_block->eca |= ECA_SII;
+-	if (kvm_s390_use_sca_entries())
++	/* interpreted SIGPs would be presented only by the machine */
++	if (kvm_s390_use_sca_entries() && !vcpu->kvm->arch.esa390_dat)
+ 		vcpu->arch.sie_block->eca |= ECA_SIGPI;
+ 	kvm_s390_vcpu_set_arch_mode_controls(vcpu);
+ 	if (test_kvm_facility(vcpu->kvm, 139))
+@@ -4693,6 +4699,10 @@ static int vcpu_pre_run(struct kvm_vcpu *vcpu)
+ 	 */
+ 	kvm_check_async_pf_completion(vcpu);
+ 
++	rc = kvm_s390_esa390_dat_check(vcpu);
++	if (rc)
++		return rc;
++
+ 	vcpu->arch.sie_block->gg14 = vcpu->run->s.regs.gprs[14];
+ 	vcpu->arch.sie_block->gg15 = vcpu->run->s.regs.gprs[15];
+ 
+@@ -4706,6 +4716,12 @@ static int vcpu_pre_run(struct kvm_vcpu *vcpu)
+ 	if (rc)
+ 		return rc;
+ 
++	if (kvm_s390_esa390_dat_enabled(vcpu)) {
++		rc = kvm_s390_esa390_dat_enter(vcpu);
++		if (rc)
++			return rc;
++	}
++
+ 	if (guestdbg_enabled(vcpu)) {
+ 		kvm_s390_backup_guest_per_regs(vcpu);
+ 		kvm_s390_patch_guest_per_regs(vcpu);
+@@ -4792,6 +4808,9 @@ static int vcpu_post_run_handle_fault(struct kvm_vcpu *vcpu)
+ 	unsigned long gaddr;
+ 	int rc;
+ 
++	if (vcpu->arch.esa390_translated)
++		return kvm_s390_esa390_dat_fault(vcpu);
++
+ 	gaddr = current->thread.gmap_teid.addr * PAGE_SIZE;
+ 	if (kvm_s390_cur_gmap_fault_is_write())
+ 		foll = FOLL_WRITE;
+@@ -4881,6 +4900,10 @@ static int vcpu_post_run(struct kvm_vcpu *vcpu, int sie_return)
+ 	}
+ 	WARN_ON_ONCE(sie_return != SIE64_RETURN_NORMAL);
+ 
++	rc = kvm_s390_esa390_dat_post_run(vcpu);
++	if (rc)
++		return rc;
++
+ 	if (vcpu->arch.sie_block->icptcode > 0) {
+ 		rc = kvm_handle_sie_intercept(vcpu);
+ 
+@@ -4921,6 +4944,7 @@ static int __vcpu_run(struct kvm_vcpu *vcpu)
+ 	int rc, sie_return;
+ 	struct sie_page *sie_page = (struct sie_page *)vcpu->arch.sie_block;
+ 	psw_t *gpsw = &vcpu->arch.sie_block->gpsw;
++	unsigned long gasce;
+ 	bool esa;
+ 
+ 	/*
+@@ -4964,22 +4988,27 @@ static int __vcpu_run(struct kvm_vcpu *vcpu)
+ 		 * The state description of a vCPU in the ESA/390-compatibility
+ 		 * mode holds the eight-byte PSW while the vCPU is in SIE.
+ 		 */
++		gasce = vcpu->arch.gmap->asce.val;
+ 		esa = kvm_s390_vcpu_is_esa(vcpu);
+ 		if (esa) {
++			gasce = kvm_s390_esa390_dat_sie_asce(vcpu, gasce);
+ 			gpsw->mask = kvm_s390_psw_to_esa(gpsw);
+ 			gpsw->addr = 0;
+ 		}
+ 
+ 		sie_return = kvm_s390_enter_exit_sie(vcpu->arch.sie_block,
+-						     vcpu->run->s.regs.gprs,
+-						     vcpu->arch.gmap->asce.val);
++						     vcpu->run->s.regs.gprs, gasce);
+ 
+-		if (esa)
++		if (esa) {
+ 			kvm_s390_psw_from_esa(gpsw, gpsw->mask);
++			kvm_s390_esa390_dat_sie_exit(vcpu);
++		}
+ 
+ 		__enable_cpu_timer_accounting(vcpu);
+ 		guest_timing_exit_irqoff();
+ 		local_irq_enable();
++		if (vcpu->arch.esa390_translated)
++			hrtimer_cancel(&vcpu->arch.ckc_timer);
+ 
+ 		if (kvm_s390_pv_cpu_is_protected(vcpu)) {
+ 			memcpy(vcpu->run->s.regs.gprs,
+diff --git a/arch/s390/kvm/s390/s390.h b/arch/s390/kvm/s390/s390.h
+index 55e90464e98c..62a43764f4a3 100644
+--- a/arch/s390/kvm/s390/s390.h
++++ b/arch/s390/kvm/s390/s390.h
+@@ -505,6 +505,27 @@ static inline void kvm_s390_retry_instr(struct kvm_vcpu *vcpu)
+ 
+ int handle_sthyi(struct kvm_vcpu *vcpu);
+ 
++/* implemented in esa390-dat.c */
++struct gmap;
++int kvm_s390_esa390_dat_enter(struct kvm_vcpu *vcpu);
++unsigned long kvm_s390_esa390_dat_sie_asce(struct kvm_vcpu *vcpu, unsigned long asce);
++void kvm_s390_esa390_dat_sie_exit(struct kvm_vcpu *vcpu);
++void kvm_s390_esa390_dat_notifier(struct gmap *sg, gpa_t start, gpa_t end);
++void kvm_s390_esa390_dat_kick(struct kvm_vcpu *vcpu);
++void kvm_s390_esa390_dat_reset_controls(struct kvm_vcpu *vcpu);
++void kvm_s390_esa390_dat_release(struct kvm *kvm);
++void kvm_s390_esa390_dat_vcpu_destroy(struct kvm_vcpu *vcpu);
++int kvm_s390_esa390_dat_fault(struct kvm_vcpu *vcpu);
++int kvm_s390_esa390_dat_prog(struct kvm_vcpu *vcpu);
++int kvm_s390_esa390_dat_post_run(struct kvm_vcpu *vcpu);
++int kvm_s390_esa390_dat_check(struct kvm_vcpu *vcpu);
++bool kvm_s390_esa390_dat_validity(struct kvm_vcpu *vcpu, u16 viwhy);
++int kvm_s390_esa390_dat_handle_sysmask(struct kvm_vcpu *vcpu);
++int kvm_s390_esa390_dat_handle_svc(struct kvm_vcpu *vcpu);
++int kvm_s390_esa390_dat_handle_lra(struct kvm_vcpu *vcpu);
++int kvm_s390_esa390_dat_handle_b2(struct kvm_vcpu *vcpu);
++void kvm_s390_esa390_dat_arm_timer(struct kvm_vcpu *vcpu);
++
+ /* implemented in priv.c */
+ int is_valid_psw(psw_t *psw);
+ int kvm_s390_is_valid_psw(struct kvm_vcpu *vcpu, psw_t *psw);
+-- 
+2.47.3
+

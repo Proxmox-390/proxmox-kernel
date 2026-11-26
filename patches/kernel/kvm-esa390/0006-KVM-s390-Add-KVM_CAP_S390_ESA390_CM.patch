@@ -1,0 +1,527 @@
+From 8672b553e31fb4da2ca1a5749fb98cf00364dde9 Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
+Date: Wed, 25 Nov 2026 12:40:14 +0100
+Subject: [RFC PATCH 6/7] KVM: s390: Add KVM_CAP_S390_ESA390_CM
+
+Operating systems and stand-alone programs that were written before the
+configuration-z/Architecture-architectural-mode facility expect to be
+loaded in ESA/390 mode: they take their first interruptions through the
+eight-byte PSWs at real 0-127 and issue SIGP set-architecture to get to
+z/Architecture. A KVM guest is always in z/Architecture mode, so such a
+program takes its first interruption through a new PSW it never set up,
+and its set-architecture order is rejected. The architecture has a mode
+for exactly this, the ESA/390-compatibility mode, which a machine provides
+to the guests of a hypervisor: a state description without the
+z/Architecture flag is run in it.
+
+Add the VM capability KVM_CAP_S390_ESA390_CM and the device attribute
+group KVM_S390_VM_ARCH_MODE, with which user space puts all vCPUs of the
+configuration into the mode and back.
+
+KVM does as little as it can. Setting the mode changes the format of the
+state descriptions (z/Architecture flag, enhanced DAT, and the execution
+controls of facilities that exist only in z/Architecture), aligns the
+prefix, and changes facility bit 2, which tells the program whether the
+z/Architecture architectural mode is active: KVM keeps that bit in line
+with the mode wherever it presents the facility list (to STORE FACILITY
+LIST, to STORE FACILITY LIST EXTENDED through the state description, and
+in KVM_S390_VM_CPU_PROCESSOR). All other facility bits, among them 138
+and 168, which describe whether the configuration offers the mode at all,
+are set by user space in its CPU model as before. The eight-byte PSW is
+put into the state description around SIE; everything else in KVM and the
+whole user space interface keep the 16-byte PSW. What the architecture
+defines for a change of the mode beyond that is left to user space, which
+has to handle SIGP itself for such a VM: the checks and register changes
+of the set-architecture order, the captured z/Architecture state, the
+ESA/390 formats of the store-status orders. A change of the mode needs all
+vCPUs outside of KVM_RUN and fails with -EBUSY otherwise, so no vCPU sees
+it in the middle of an interception.
+
+The capability is offered on every host, like KVM_CAP_S390_VSIE_ESAMODE.
+Both depend on the same property: the SIE instruction of this host runs a
+state description without the z/Architecture flag. With vsie it is the
+shadow state description of a nested guest, here the state description of
+a guest of KVM itself; the machine (or the hypervisor below) sees the same
+format either way. KVM_CAP_S390_VSIE_ESAMODE is offered unconditionally,
+since no facility bit, SCLP indication or machine generation describes
+that property: facility bit 168 describes a guest configuration, and bit
+138 is set by KVM for its own guests on every machine. A host that does
+not run such a state description answers it with a validity interception,
+and KVM_RUN fails with -EINVAL (with a message instead of a warning, see
+the previous patch); the host is not affected. Requiring a module
+parameter as well would only make the administrator state what KVM cannot
+check either.
+
+Not supported in the mode: guest debugging (refused when the mode is set
+while it is enabled for a vCPU), protected and user-controlled VMs.
+
+Assisted-by: Claude:claude-fable-5-2
+Assisted-by: Claude:claude-opus-5-5
+---
+ Documentation/virt/kvm/api.rst        |  63 +++++++++
+ Documentation/virt/kvm/devices/vm.rst |  36 +++++
+ arch/s390/include/uapi/asm/kvm.h      |   8 ++
+ arch/s390/kvm/s390/s390.c             | 184 ++++++++++++++++++++++++--
+ arch/s390/kvm/s390/s390.h             |  11 ++
+ include/uapi/linux/kvm.h              |   1 +
+ 6 files changed, 290 insertions(+), 13 deletions(-)
+
+diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
+index e0430cc750c9..2f7310c12689 100644
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -9056,6 +9056,69 @@ enabled, cmma can't be enabled anymore and pfmfi and the storage key
+ interpretation are disabled. If cmma has already been enabled or the
+ hpage_2g module parameter is not set to 1, -EINVAL is returned.
+ 
++7.48 KVM_CAP_S390_ESA390_CM
++---------------------------
++
++:Architectures: s390
++:Type: vm
++:Parameters: none
++:Returns: 0 on success; -EINVAL if KVM_CAP_S390_USER_SIGP is not enabled or
++          the VM has the KVM_VM_S390_UCONTROL flag set; -EBUSY if vCPUs were
++          already created for the VM.
++
++This capability lets the configuration be put into the ESA/390-compatibility
++mode, the architectural mode in which a machine that otherwise only provides
++z/Architecture runs programs written for ESA/390 that do not use dynamic
++address translation. Operating systems and stand-alone programs that are
++loaded in ESA/390 mode and switch to z/Architecture themselves with SIGNAL
++PROCESSOR (set architecture) need it.
++
++In the mode, the vCPUs run on state descriptions without the z/Architecture
++flag. As for KVM_CAP_S390_VSIE_ESAMODE, KVM cannot tell in advance whether
++the machine, or the hypervisor KVM runs under, accepts such state
++descriptions. If it does not, KVM_RUN fails with -EINVAL after a validity
++interception.
++
++The VM stays in z/Architecture mode until user space sets the mode through
++the device attribute group KVM_S390_VM_ARCH_MODE (see
++Documentation/virt/kvm/devices/vm.rst).
++
++Facility bit 2 (z/Architecture architectural mode active) is maintained by
++KVM once the capability is enabled: it is zero while the configuration is in
++the mode and one otherwise, in the facility list the guest sees (STORE
++FACILITY LIST, STORE FACILITY LIST EXTENDED) and in the one returned by
++KVM_S390_VM_CPU_PROCESSOR. Every other facility bit is the responsibility of
++user space, which sets it through KVM_S390_VM_CPU_PROCESSOR as usual. A
++configuration that is to offer the mode architecturally has bit 168
++(ESA/390-compatibility-mode facility) one and bit 138
++(configuration-z/Architecture-architectural-mode facility) zero; KVM sets
++bit 138 when the VM is created and does not change either bit for this
++capability.
++
++While the configuration is in the mode
++
++- KVM presents interruptions with eight-byte old and new PSWs and the other
++  ESA/390 assigned storage locations, uses a prefix area of 4K bytes and
++  applies low-address protection to locations 0-511 only;
++- all interfaces keep exchanging the PSW in the 16-byte z/Architecture format
++  (struct kvm_run, KVM_S390_SET_INITIAL_PSW). Bit 12 is zero in that format,
++  bits 97-127 hold the instruction address. A PSW with the DAT bit or the
++  extended-addressing-mode bit is invalid in the mode;
++- the prefix (KVM_SYNC_PREFIX, KVM_REG_S390_PREFIX) is a multiple of 4K;
++- the high halves of the general and control registers are not used. User
++  space is responsible for the register contents that the architecture
++  defines for a change of the mode;
++- SIGP orders that KVM executes itself and that exist only in z/Architecture
++  are rejected as invalid orders. All other orders, including set
++  architecture, are handled by user space, which has to use the ESA/390
++  formats (for instance for store status);
++- KVM_S390_STORE_STATUS returns -EINVAL, the guest cannot start interpretive
++  execution, and the VM cannot become a protected VM (KVM_PV_ENABLE returns
++  -EINVAL once the capability is enabled);
++- guest debugging is not supported: KVM_SET_GUEST_DEBUG with
++  KVM_GUESTDBG_ENABLE returns -EINVAL, and setting the mode returns -EINVAL
++  while guest debugging is enabled for any vCPU.
++
+ 8. Other capabilities.
+ ======================
+ 
+diff --git a/Documentation/virt/kvm/devices/vm.rst b/Documentation/virt/kvm/devices/vm.rst
+index a4d39fa1b083..fbb2fafa9c2d 100644
+--- a/Documentation/virt/kvm/devices/vm.rst
++++ b/Documentation/virt/kvm/devices/vm.rst
+@@ -400,3 +400,39 @@ will reject attempts to define a filter for any portion of these ranges:
+         0x8000_0000 0x8000_FFFF
+         0xC000_0000 0xC000_FFFF
+         =========== ===============
++
++7. GROUP: KVM_S390_VM_ARCH_MODE
++===============================
++
++:Architectures: s390
++
++7.1. ATTRIBUTE: KVM_S390_VM_ARCH_MODE_CURRENT (r/w)
++---------------------------------------------------
++
++The architectural mode of the configuration, available with
++KVM_CAP_S390_ESA390_CM enabled.
++
++:Parameters: address of a buffer in user space (u32) with one of
++
++	     ==============================  ==================================
++	     KVM_S390_ARCH_MODE_ZARCH        z/Architecture architectural mode
++	     KVM_S390_ARCH_MODE_ESA390_CM    ESA/390-compatibility mode
++	     ==============================  ==================================
++
++:Returns:   -ENXIO if the capability is not enabled;
++	    -EFAULT if the given address is not accessible from kernel space;
++	    -EINVAL for an unknown mode, or to enter the
++	    ESA/390-compatibility mode while guest debugging is enabled for a
++	    vCPU;
++	    -EBUSY if a vCPU is running or executes another ioctl;
++	    0 in case of success.
++
++Setting the attribute changes the mode of all vCPUs. It only switches the
++way KVM runs the vCPUs and presents interruptions. The effects on register
++contents that the architecture defines for a change of the mode (for a
++reset that belongs to a load, or for the SIGP set-architecture order) have
++to be applied by user space, see KVM_CAP_S390_ESA390_CM in
++Documentation/virt/kvm/api.rst. KVM aligns the prefix of every vCPU to the
++prefix area of the new mode and changes facility bit 2 (z/Architecture
++architectural mode active) in the facility list of the VM; all other facility
++bits are left to user space.
+diff --git a/arch/s390/include/uapi/asm/kvm.h b/arch/s390/include/uapi/asm/kvm.h
+index 4192769b5ce0..fbbd8fc5acda 100644
+--- a/arch/s390/include/uapi/asm/kvm.h
++++ b/arch/s390/include/uapi/asm/kvm.h
+@@ -388,6 +388,14 @@ struct kvm_s390_io_adapter_req {
+ #define KVM_S390_VM_CPU_MODEL		3
+ #define KVM_S390_VM_MIGRATION		4
+ #define KVM_S390_VM_CPU_TOPOLOGY	5
++#define KVM_S390_VM_ARCH_MODE		6
++
++/* kvm attributes for KVM_S390_VM_ARCH_MODE */
++#define KVM_S390_VM_ARCH_MODE_CURRENT	0
++
++/* architectural modes for KVM_S390_VM_ARCH_MODE_CURRENT */
++#define KVM_S390_ARCH_MODE_ZARCH	0
++#define KVM_S390_ARCH_MODE_ESA390_CM	1
+ 
+ /* kvm attributes for mem_ctrl */
+ #define KVM_S390_VM_MEM_ENABLE_CMMA	0
+diff --git a/arch/s390/kvm/s390/s390.c b/arch/s390/kvm/s390/s390.c
+index a5bea475fbd3..63c4c1a3be57 100644
+--- a/arch/s390/kvm/s390/s390.c
++++ b/arch/s390/kvm/s390/s390.c
+@@ -211,6 +211,8 @@ static int nested;
+ module_param(nested, int, S_IRUGO);
+ MODULE_PARM_DESC(nested, "Nested virtualization support");
+ 
++static void kvm_s390_update_fac_arch_mode(struct kvm *kvm);
++
+ /* allow 1m huge page guest backing */
+ static int hpage;
+ module_param(hpage, int, 0444);
+@@ -724,6 +726,14 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	case KVM_CAP_S390_CPU_TOPOLOGY:
+ 		r = test_facility(11);
+ 		break;
++	case KVM_CAP_S390_ESA390_CM:
++		/*
++		 * Like KVM_CAP_S390_VSIE_ESAMODE, this relies on SIE accepting
++		 * state descriptions without the z/Architecture flag; there is
++		 * no indication of that to test.
++		 */
++		r = !(kvm && kvm_is_ucontrol(kvm));
++		break;
+ 	default:
+ 		r = 0;
+ 	}
+@@ -939,6 +949,21 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm, struct kvm_enable_cap *cap)
+ 		kvm->arch.allow_vsie_esamode = 1;
+ 		r = 0;
+ 		break;
++	case KVM_CAP_S390_ESA390_CM:
++		mutex_lock(&kvm->lock);
++		if (kvm->created_vcpus) {
++			r = -EBUSY;
++		} else if (kvm_is_ucontrol(kvm) || !kvm->arch.user_sigp) {
++			r = -EINVAL;
++		} else {
++			kvm->arch.esa390_cm = true;
++			kvm_s390_update_fac_arch_mode(kvm);
++			r = 0;
++		}
++		mutex_unlock(&kvm->lock);
++		VM_EVENT(kvm, 3, "ENABLE: CAP_S390_ESA390_CM %s",
++			 r ? "(not available)" : "(success)");
++		break;
+ 	default:
+ 		r = -EINVAL;
+ 		break;
+@@ -1470,6 +1495,124 @@ static int kvm_s390_get_tod(struct kvm *kvm, struct kvm_device_attr *attr)
+ 	return ret;
+ }
+ 
++/*
++ * Facility bit 2 tells whether the z/Architecture architectural mode is
++ * active. For a VM with KVM_CAP_S390_ESA390_CM, KVM keeps it in line with the
++ * mode in the facility list that the guest and user space see. All other
++ * bits, those of the ESA/390-compatibility-mode facility (168) and of the
++ * configuration-z/Architecture-architectural-mode facility (138) included,
++ * stay as user space set them.
++ */
++static void kvm_s390_update_fac_arch_mode(struct kvm *kvm)
++{
++	if (!kvm->arch.esa390_cm)
++		return;
++	if (kvm->arch.esa390_cm_active)
++		clear_kvm_facility(kvm->arch.model.fac_list, 2);
++	else
++		set_kvm_facility(kvm->arch.model.fac_list, 2);
++}
++
++/*
++ * The flags and execution controls of a state description that depend on the
++ * architectural mode. An ESA/390-format state description has no enhanced
++ * DAT, and the facilities that exist only in the z/Architecture architectural
++ * mode are not enabled in it: transactional execution, vector registers,
++ * guarded storage and runtime instrumentation. The latter two are enabled
++ * again on first use.
++ */
++static void kvm_s390_vcpu_set_arch_mode_controls(struct kvm_vcpu *vcpu)
++{
++	struct kvm_s390_sie_block *scb = vcpu->arch.sie_block;
++
++	kvm_s390_clear_cpuflags(vcpu, CPUSTAT_ZARCH | CPUSTAT_GED | CPUSTAT_GED2);
++	scb->ecb &= ~(ECB_TE | ECB_GS);
++	scb->ecb3 &= ~ECB3_RI;
++	scb->eca &= ~ECA_VX;
++	scb->ecd &= ~ECD_HOSTREGMGMT;
++	if (kvm_s390_vcpu_is_esa(vcpu))
++		return;
++
++	kvm_s390_set_cpuflags(vcpu, CPUSTAT_ZARCH);
++	if (test_kvm_facility(vcpu->kvm, 78))
++		kvm_s390_set_cpuflags(vcpu, CPUSTAT_GED2);
++	else if (test_kvm_facility(vcpu->kvm, 8))
++		kvm_s390_set_cpuflags(vcpu, CPUSTAT_GED);
++	if (test_kvm_facility(vcpu->kvm, 73))
++		scb->ecb |= ECB_TE;
++	if (test_kvm_facility(vcpu->kvm, 129)) {
++		scb->eca |= ECA_VX;
++		scb->ecd |= ECD_HOSTREGMGMT;
++	}
++}
++
++/*
++ * Put all vCPUs into the ESA/390-compatibility mode or into the z/Architecture
++ * architectural mode. Only the format of the state descriptions changes; the
++ * register contents the mode change defines (PSW, control registers, prefix)
++ * are the business of user space, except that the prefix is aligned to the
++ * prefix area of the new mode.
++ */
++static int kvm_s390_set_arch_mode(struct kvm *kvm, bool esa)
++{
++	struct kvm_vcpu *vcpu;
++	unsigned long i;
++	int rc;
++
++	lockdep_assert_held(&kvm->lock);
++
++	if (kvm->arch.esa390_cm_active == esa)
++		return 0;
++	/* no vCPU may be running or be in the middle of an interception */
++	rc = kvm_trylock_all_vcpus(kvm);
++	if (rc)
++		return rc;
++	/* guest debugging is not supported in the mode */
++	if (esa) {
++		kvm_for_each_vcpu(i, vcpu, kvm) {
++			if (guestdbg_enabled(vcpu)) {
++				kvm_unlock_all_vcpus(kvm);
++				return -EINVAL;
++			}
++		}
++	}
++	kvm->arch.esa390_cm_active = esa;
++	kvm_for_each_vcpu(i, vcpu, kvm) {
++		kvm_s390_vcpu_set_arch_mode_controls(vcpu);
++		kvm_s390_set_prefix(vcpu, kvm_s390_get_prefix(vcpu));
++	}
++	kvm_s390_update_fac_arch_mode(kvm);
++	kvm_unlock_all_vcpus(kvm);
++	VM_EVENT(kvm, 3, "architectural mode: %s", esa ? "ESA/390-CM" : "z/Architecture");
++	return 0;
++}
++
++static int kvm_s390_vm_set_arch_mode(struct kvm *kvm, struct kvm_device_attr *attr)
++{
++	u32 mode;
++
++	if (!kvm->arch.esa390_cm || attr->attr != KVM_S390_VM_ARCH_MODE_CURRENT)
++		return -ENXIO;
++	if (get_user(mode, (u32 __user *)attr->addr))
++		return -EFAULT;
++	if (mode != KVM_S390_ARCH_MODE_ZARCH && mode != KVM_S390_ARCH_MODE_ESA390_CM)
++		return -EINVAL;
++
++	guard(mutex)(&kvm->lock);
++	return kvm_s390_set_arch_mode(kvm, mode == KVM_S390_ARCH_MODE_ESA390_CM);
++}
++
++static int kvm_s390_vm_get_arch_mode(struct kvm *kvm, struct kvm_device_attr *attr)
++{
++	u32 mode = KVM_S390_ARCH_MODE_ZARCH;
++
++	if (!kvm->arch.esa390_cm || attr->attr != KVM_S390_VM_ARCH_MODE_CURRENT)
++		return -ENXIO;
++	if (READ_ONCE(kvm->arch.esa390_cm_active))
++		mode = KVM_S390_ARCH_MODE_ESA390_CM;
++	return put_user(mode, (u32 __user *)attr->addr) ? -EFAULT : 0;
++}
++
+ static int kvm_s390_set_processor(struct kvm *kvm, struct kvm_device_attr *attr)
+ {
+ 	struct kvm_s390_vm_cpu_processor *proc;
+@@ -1501,6 +1644,7 @@ static int kvm_s390_set_processor(struct kvm *kvm, struct kvm_device_attr *attr)
+ 		}
+ 		memcpy(kvm->arch.model.fac_list, proc->fac_list,
+ 		       S390_ARCH_FAC_LIST_SIZE_BYTE);
++		kvm_s390_update_fac_arch_mode(kvm);
+ 		VM_EVENT(kvm, 3, "SET: guest ibc: 0x%4.4x, guest cpuid: 0x%16.16llx",
+ 			 kvm->arch.model.ibc,
+ 			 kvm->arch.model.cpuid);
+@@ -2038,6 +2182,9 @@ static int kvm_s390_vm_set_attr(struct kvm *kvm, struct kvm_device_attr *attr)
+ 	case KVM_S390_VM_CPU_TOPOLOGY:
+ 		ret = kvm_s390_set_topo_change_indication(kvm, attr);
+ 		break;
++	case KVM_S390_VM_ARCH_MODE:
++		ret = kvm_s390_vm_set_arch_mode(kvm, attr);
++		break;
+ 	default:
+ 		ret = -ENXIO;
+ 		break;
+@@ -2066,6 +2213,9 @@ static int kvm_s390_vm_get_attr(struct kvm *kvm, struct kvm_device_attr *attr)
+ 	case KVM_S390_VM_CPU_TOPOLOGY:
+ 		ret = kvm_s390_get_topo_change_indication(kvm, attr);
+ 		break;
++	case KVM_S390_VM_ARCH_MODE:
++		ret = kvm_s390_vm_get_arch_mode(kvm, attr);
++		break;
+ 	default:
+ 		ret = -ENXIO;
+ 		break;
+@@ -2144,6 +2294,10 @@ static int kvm_s390_vm_has_attr(struct kvm *kvm, struct kvm_device_attr *attr)
+ 	case KVM_S390_VM_CPU_TOPOLOGY:
+ 		ret = test_kvm_facility(kvm, 11) ? 0 : -ENXIO;
+ 		break;
++	case KVM_S390_VM_ARCH_MODE:
++		ret = kvm->arch.esa390_cm &&
++		      attr->attr == KVM_S390_VM_ARCH_MODE_CURRENT ? 0 : -ENXIO;
++		break;
+ 	default:
+ 		ret = -ENXIO;
+ 		break;
+@@ -3688,15 +3842,9 @@ static int kvm_s390_vcpu_setup(struct kvm_vcpu *vcpu)
+ 	int rc = 0;
+ 	u16 uvrc, uvrrc;
+ 
+-	atomic_set(&vcpu->arch.sie_block->cpuflags, CPUSTAT_ZARCH |
+-						    CPUSTAT_SM |
++	atomic_set(&vcpu->arch.sie_block->cpuflags, CPUSTAT_SM |
+ 						    CPUSTAT_STOPPED);
+ 
+-	if (test_kvm_facility(vcpu->kvm, 78))
+-		kvm_s390_set_cpuflags(vcpu, CPUSTAT_GED2);
+-	else if (test_kvm_facility(vcpu->kvm, 8))
+-		kvm_s390_set_cpuflags(vcpu, CPUSTAT_GED);
+-
+ 	kvm_s390_vcpu_setup_model(vcpu);
+ 
+ 	/* pgste_set_pte has special handling for !machine_has_esop() */
+@@ -3706,8 +3854,6 @@ static int kvm_s390_vcpu_setup(struct kvm_vcpu *vcpu)
+ 		vcpu->arch.sie_block->ecb |= ECB_SRSI;
+ 	if (test_kvm_facility(vcpu->kvm, 11))
+ 		vcpu->arch.sie_block->ecb |= ECB_PTF;
+-	if (test_kvm_facility(vcpu->kvm, 73))
+-		vcpu->arch.sie_block->ecb |= ECB_TE;
+ 	if (!kvm_is_ucontrol(vcpu->kvm))
+ 		vcpu->arch.sie_block->ecb |= ECB_SPECI;
+ 
+@@ -3724,10 +3870,7 @@ static int kvm_s390_vcpu_setup(struct kvm_vcpu *vcpu)
+ 		vcpu->arch.sie_block->eca |= ECA_SII;
+ 	if (kvm_s390_use_sca_entries())
+ 		vcpu->arch.sie_block->eca |= ECA_SIGPI;
+-	if (test_kvm_facility(vcpu->kvm, 129)) {
+-		vcpu->arch.sie_block->eca |= ECA_VX;
+-		vcpu->arch.sie_block->ecd |= ECD_HOSTREGMGMT;
+-	}
++	kvm_s390_vcpu_set_arch_mode_controls(vcpu);
+ 	if (test_kvm_facility(vcpu->kvm, 139))
+ 		vcpu->arch.sie_block->ecd |= ECD_MEF;
+ 	if (test_kvm_facility(vcpu->kvm, 156))
+@@ -4777,6 +4920,8 @@ static int __vcpu_run(struct kvm_vcpu *vcpu)
+ {
+ 	int rc, sie_return;
+ 	struct sie_page *sie_page = (struct sie_page *)vcpu->arch.sie_block;
++	psw_t *gpsw = &vcpu->arch.sie_block->gpsw;
++	bool esa;
+ 
+ 	/*
+ 	 * We try to hold kvm->srcu during most of vcpu_run (except when run-
+@@ -4815,10 +4960,23 @@ static int __vcpu_run(struct kvm_vcpu *vcpu)
+ 		guest_timing_enter_irqoff();
+ 		__disable_cpu_timer_accounting(vcpu);
+ 
++		/*
++		 * The state description of a vCPU in the ESA/390-compatibility
++		 * mode holds the eight-byte PSW while the vCPU is in SIE.
++		 */
++		esa = kvm_s390_vcpu_is_esa(vcpu);
++		if (esa) {
++			gpsw->mask = kvm_s390_psw_to_esa(gpsw);
++			gpsw->addr = 0;
++		}
++
+ 		sie_return = kvm_s390_enter_exit_sie(vcpu->arch.sie_block,
+ 						     vcpu->run->s.regs.gprs,
+ 						     vcpu->arch.gmap->asce.val);
+ 
++		if (esa)
++			kvm_s390_psw_from_esa(gpsw, gpsw->mask);
++
+ 		__enable_cpu_timer_accounting(vcpu);
+ 		guest_timing_exit_irqoff();
+ 		local_irq_enable();
+diff --git a/arch/s390/kvm/s390/s390.h b/arch/s390/kvm/s390/s390.h
+index 2fb412c1d3f8..5e1b2a1af1ba 100644
+--- a/arch/s390/kvm/s390/s390.h
++++ b/arch/s390/kvm/s390/s390.h
+@@ -292,6 +292,17 @@ static inline int set_kvm_facility(u64 *fac_list, unsigned long nr)
+ 	return 0;
+ }
+ 
++static inline int clear_kvm_facility(u64 *fac_list, unsigned long nr)
++{
++	unsigned char *ptr;
++
++	if (nr >= MAX_FACILITY_BIT)
++		return -EINVAL;
++	ptr = (unsigned char *)fac_list + (nr >> 3);
++	*ptr &= ~(0x80UL >> (nr & 7));
++	return 0;
++}
++
+ static inline int test_kvm_cpu_feat(struct kvm *kvm, unsigned long nr)
+ {
+ 	WARN_ON_ONCE(nr >= KVM_S390_VM_CPU_FEAT_NR_BITS);
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+index ac2d77d14963..5aba1c564621 100644
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -999,6 +999,7 @@ struct kvm_enable_cap {
+ #define KVM_CAP_S390_HPAGE_2G 249
+ #define KVM_CAP_PPC_COMPAT_CAPS 250
+ #define KVM_CAP_ARM_PMU_V3_STRICT 251
++#define KVM_CAP_S390_ESA390_CM 253
+ 
+ struct kvm_irq_routing_irqchip {
+ 	__u32 irqchip;
+-- 
+2.47.3
+

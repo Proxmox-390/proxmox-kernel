@@ -1,0 +1,764 @@
+From 18355f97568ac2a35a9161149ed1ea7d1525e6bb Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
+Date: Wed, 25 Nov 2026 12:40:14 +0100
+Subject: [RFC PATCH 7/7] KVM: s390: selftests: Add a test for the
+ ESA/390-compatibility mode
+
+Run a small ESA/390 program without dynamic address translation in a VM
+with KVM_CAP_S390_ESA390_CM and check, with one and with two vCPUs:
+
+- the capability and the attribute are refused when they cannot be used;
+- interruptions the machine presents (supervisor call, the specification
+  exception for a PSW with the DAT bit) and the ones KVM presents
+  (operation exception, injected program interruption, restart, external,
+  input/output, machine check) use the eight-byte PSWs and the ESA/390
+  locations, in the prefix area of the CPU, and leave the z/Architecture
+  PSW locations alone;
+- the PSW is exchanged with user space in the 16-byte format;
+- a prefix area of 4K bytes is used, and the prefix is aligned to 8K when
+  the configuration leaves the mode;
+- SIGP external call and emergency signal reach a second CPU, sense
+  running status is an invalid order, set architecture comes to user
+  space;
+- the switch to z/Architecture and back;
+- facility bit 2 is zero in the mode and one in z/Architecture mode, in
+  KVM_S390_VM_CPU_PROCESSOR and for STORE FACILITY LIST (EXTENDED) in the
+  guest, while bits 138 and 168 stay as user space set them;
+- guest debugging cannot be enabled in the mode, and the mode cannot be
+  entered while it is enabled.
+
+The checks that need no guest to run (interface, facility list, guest
+debugging) also run on a host that refuses ESA/390-format state
+descriptions; the test skips the rest there.
+
+The address of the second prefix area can be given as an argument.
+
+Assisted-by: Claude:claude-fable-5-2
+Assisted-by: Claude:claude-opus-5-5
+---
+ tools/testing/selftests/kvm/Makefile.kvm      |   1 +
+ .../selftests/kvm/s390/esa390_cm_test.c       | 700 ++++++++++++++++++
+ 2 files changed, 701 insertions(+)
+ create mode 100644 tools/testing/selftests/kvm/s390/esa390_cm_test.c
+
+diff --git a/tools/testing/selftests/kvm/Makefile.kvm b/tools/testing/selftests/kvm/Makefile.kvm
+index f43549a56f0b..ff9f9740b904 100644
+--- a/tools/testing/selftests/kvm/Makefile.kvm
++++ b/tools/testing/selftests/kvm/Makefile.kvm
+@@ -221,6 +221,7 @@ TEST_GEN_PROGS_s390 += s390/ucontrol_test
+ TEST_GEN_PROGS_s390 += s390/user_operexec
+ TEST_GEN_PROGS_s390 += s390/keyop
+ TEST_GEN_PROGS_s390 += s390/vsie_esa_test
++TEST_GEN_PROGS_s390 += s390/esa390_cm_test
+ TEST_GEN_PROGS_s390 += rseq_test
+ TEST_GEN_PROGS_s390 += s390/irq_routing
+ TEST_GEN_PROGS_s390 += mmu_stress_test
+diff --git a/tools/testing/selftests/kvm/s390/esa390_cm_test.c b/tools/testing/selftests/kvm/s390/esa390_cm_test.c
+new file mode 100644
+index 000000000000..10a02ffdd6fd
+--- /dev/null
++++ b/tools/testing/selftests/kvm/s390/esa390_cm_test.c
+@@ -0,0 +1,700 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Test the ESA/390-compatibility mode (KVM_CAP_S390_ESA390_CM).
++ *
++ * The guest is a small program without dynamic address translation that is
++ * started in the mode. The test checks that the machine and KVM present
++ * interruptions in ESA/390 format, that the z/Architecture locations stay
++ * untouched, and that the configuration can be switched to z/Architecture and
++ * back the way user space does it for the SIGP set-architecture order.
++ */
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++
++#include "kvm_util.h"
++#include "test_util.h"
++#include "kselftest.h"
++#include "sie.h"
++
++#define GUEST_MEM_PAGES		256
++#define GUEST_CODE		0x2000UL
++/* a prefix that is a multiple of 4K, but not of 8K */
++#define ALT_PREFIX_DEFAULT	0x5000UL
++
++/* guest data, addressable without a base register */
++#define D_EPSW		0xe00
++#define D_SENSE_RUN	0xe20
++#define D_SETARCH	0xe28
++#define D_LGHI		0xe30
++#define D_EPSW_Z	0xe38
++#define D_XCALL		0xe40
++#define D_CR0		0xe80
++#define D_CR14		0xe84
++#define D_PSW_WAIT	0xe88
++#define D_PSW_DAT	0xe90
++#define D_CR6		0xe98
++#define D_CPUADDR	0xea0
++#define D_STFLE		0xec0
++
++/* ESA/390 assigned storage locations */
++#define ESA_RST_NEW	0
++#define ESA_RST_OLD	8
++#define ESA_EXT_OLD	24
++#define ESA_SVC_OLD	32
++#define ESA_PGM_OLD	40
++#define ESA_MCK_OLD	48
++#define ESA_IO_OLD	56
++#define ESA_EXT_NEW	88
++#define ESA_SVC_NEW	96
++#define ESA_PGM_NEW	104
++#define ESA_MCK_NEW	112
++#define ESA_IO_NEW	120
++#define LC_EXT_PARAMS	128
++#define LC_EXT_CPU_ADDR	132
++#define LC_EXT_CODE	134
++#define LC_SVC_ILC	136
++#define LC_PGM_ILC	140
++#define LC_MCCK_CODE	232
++#define LC_SUBCHANNEL	184
++#define LC_IO_PARM	188
++#define LC_AR_MODE_ID	163
++#define LC_STFL		200
++#define ESA_CREGS_SAVE	448
++/* z/Architecture assigned storage locations */
++#define Z_OLD_PSWS	0x120
++#define Z_SVC_OLD	0x140
++#define Z_SVC_NEW	0x1c0
++#define Z_NEW_PSWS_END	0x200
++
++/* exits of the guest: DIAGNOSE 0x501 with the number as r1 */
++enum guest_exit {
++	EXIT_SVC = 1, EXIT_EXT, EXIT_IO, EXIT_MCK, EXIT_PGM, EXIT_RST,
++	EXIT_SVC_Z, EXIT_XCALL, EXIT_STFL, EXIT_FAIL = 14,
++};
++
++#define GUEST_CR0	0x000062e0U
++
++#define ESA_PSW_BIT12	0x00080000U
++#define ESA_PSW_WAIT	0x00020000U
++#define ESA_PSW_DAT	0x04000000U
++#define ESA_PSW_INT	0x03040000U	/* I/O, external, machine check */
++#define ESA_PSW_AMODE31	0x80000000U
++#define PSW_MASK_BA	0x0000000080000000ULL
++#define PSW_MASK_CC	0x0000300000000000ULL
++
++#define SIGP_STATUS_INVALID_ORDER	0x00000002U
++
++/* facility bits; KVM maintains bit 2 only, user space all others */
++#define FAC_ZARCH_ACTIVE	2
++#define FAC_CZAM		138
++#define FAC_ESA390_CM		168
++
++extern char esa_guest_start[], esa_guest_end[];
++extern char g_basic[], g_wait[], g_dat[], g_opc[], g_sigp[], g_xcall[], g_stfl[];
++extern char s_svc[], s_ext[], s_io[], s_mck[], s_pgm[], s_rst[], sz_svc[];
++
++asm("	.pushsection .rodata, \"a\"\n"
++	"	.balign	8\n"
++	"esa_guest_start:\n"
++	"g_basic:\n"
++	"	epsw	%r1,%r2\n"
++	"	st	%r1,0xe00\n"
++	"	st	%r2,0xe04\n"
++	"	svc	0x55\n"
++	"g_wait:\n"
++	"	lctl	%c0,%c0,0xe80\n"
++	"	lctl	%c14,%c14,0xe84\n"
++	"	lctl	%c6,%c6,0xe98\n"
++	"	lpsw	0xe88\n"
++	"g_dat:\n"
++	"	lpsw	0xe90\n"
++	"	diag	14,0,0x501\n"
++	"g_opc:\n"
++	"	.word	0x0000\n"
++	"	diag	14,0,0x501\n"
++	"g_sigp:\n"
++	"	stap	0xea0\n"
++	"	lh	%r4,0xea0\n"
++	"	lhi	%r2,-1\n"
++	"	sigp	%r2,%r4,0x15\n"
++	"	ipm	%r1\n"
++	"	st	%r1,0xe20\n"
++	"	st	%r2,0xe24\n"
++	"	lhi	%r3,1\n"
++	"	sigp	%r2,%r4,0x12\n"
++	"	ipm	%r1\n"
++	"	st	%r1,0xe28\n"
++	"	lghi	%r5,-1\n"
++	"	stg	%r5,0xe30\n"
++	"	epsw	%r1,%r2\n"
++	"	st	%r1,0xe38\n"
++	"	svc	0x57\n"
++	"g_xcall:\n"
++	"	lhi	%r4,1\n"
++	"	lhi	%r2,-1\n"
++	"	sigp	%r2,%r4,0x02\n"
++	"	ipm	%r1\n"
++	"	st	%r1,0xe40\n"
++	"	sigp	%r2,%r4,0x03\n"
++	"	ipm	%r1\n"
++	"	st	%r1,0xe44\n"
++	"	st	%r2,0xe48\n"
++	"	diag	8,0,0x501\n"
++	"g_stfl:\n"
++	"	stfl	0(0)\n"
++	"	lhi	%r0,2\n"
++	"	stfle	0xec0(0)\n"
++	"	diag	9,0,0x501\n"
++	"s_svc:	diag	1,0,0x501\n"
++	"s_ext:	diag	2,0,0x501\n"
++	"s_io:	diag	3,0,0x501\n"
++	"s_mck:	diag	4,0,0x501\n"
++	"s_pgm:	diag	5,0,0x501\n"
++	"s_rst:	diag	6,0,0x501\n"
++	"sz_svc:	diag	7,0,0x501\n"
++	"esa_guest_end:\n"
++	"	.popsection\n");
++
++static struct kvm_vm *vm;
++static u8 *mem;
++static unsigned long alt_prefix = ALT_PREFIX_DEFAULT;
++
++static u64 gaddr(const char *label)
++{
++	return GUEST_CODE + (label - esa_guest_start);
++}
++
++static u32 rd32(u8 *lc, unsigned long addr)
++{
++	return be32toh(*(u32 *)(lc + addr));
++}
++
++static u64 rd64(u8 *lc, unsigned long addr)
++{
++	return be64toh(*(u64 *)(lc + addr));
++}
++
++static void wr_esa_psw(u8 *lc, unsigned long addr, u32 mask, u64 ia)
++{
++	*(u32 *)(lc + addr) = htobe32(mask | ESA_PSW_BIT12);
++	*(u32 *)(lc + addr + 4) = htobe32(ESA_PSW_AMODE31 | ia);
++}
++
++static void wr_z_psw(u8 *lc, unsigned long addr, u64 mask, u64 ia)
++{
++	*(u64 *)(lc + addr) = htobe64(mask);
++	*(u64 *)(lc + addr + 8) = htobe64(ia);
++}
++
++static u64 esa_psw(u32 mask, u64 ia)
++{
++	return (u64)(mask | ESA_PSW_BIT12) << 32 | ESA_PSW_AMODE31 | ia;
++}
++
++/* write the fixed storage a CPU with the prefix area at @lc needs */
++static void setup_lowcore(u8 *lc)
++{
++	memset(lc, 0, 2 * getpagesize());
++	wr_esa_psw(lc, ESA_RST_NEW, 0, gaddr(s_rst));
++	wr_esa_psw(lc, ESA_EXT_NEW, 0, gaddr(s_ext));
++	wr_esa_psw(lc, ESA_SVC_NEW, 0, gaddr(s_svc));
++	wr_esa_psw(lc, ESA_PGM_NEW, 0, gaddr(s_pgm));
++	wr_esa_psw(lc, ESA_MCK_NEW, 0, gaddr(s_mck));
++	wr_esa_psw(lc, ESA_IO_NEW, 0, gaddr(s_io));
++	wr_z_psw(lc, Z_SVC_NEW, PSW_MASK_BA, gaddr(sz_svc));
++	/* external call, emergency signal and service signal */
++	*(u32 *)(lc + D_CR0) = htobe32(GUEST_CR0);
++	/* channel report pending */
++	*(u32 *)(lc + D_CR14) = htobe32(0xd2000000);
++	/* all I/O-interruption subclasses */
++	*(u32 *)(lc + D_CR6) = htobe32(0xff000000);
++	wr_esa_psw(lc, D_PSW_WAIT, ESA_PSW_INT | ESA_PSW_WAIT, 0);
++	wr_esa_psw(lc, D_PSW_DAT, ESA_PSW_DAT, gaddr(g_dat) + 4);
++}
++
++static bool z_psws_untouched(u8 *lc)
++{
++	static const u8 zero[Z_SVC_NEW - Z_OLD_PSWS];
++
++	return !memcmp(lc + Z_OLD_PSWS, zero, sizeof(zero));
++}
++
++static int get_mode(void)
++{
++	u32 mode = -1;
++
++	if (__kvm_device_attr_get(vm->fd, KVM_S390_VM_ARCH_MODE,
++				  KVM_S390_VM_ARCH_MODE_CURRENT, &mode))
++		return -errno;
++	return mode;
++}
++
++static int set_mode(u32 mode)
++{
++	if (__kvm_device_attr_set(vm->fd, KVM_S390_VM_ARCH_MODE,
++				  KVM_S390_VM_ARCH_MODE_CURRENT, &mode))
++		return -errno;
++	return 0;
++}
++
++static void get_processor(struct kvm_s390_vm_cpu_processor *proc)
++{
++	kvm_device_attr_get(vm->fd, KVM_S390_VM_CPU_MODEL,
++			    KVM_S390_VM_CPU_PROCESSOR, proc);
++}
++
++static bool fac_test(const __u64 *fac, int nr)
++{
++	return fac[nr / 64] & (1ULL << (63 - nr % 64));
++}
++
++static void fac_set(__u64 *fac, int nr, bool on)
++{
++	if (on)
++		fac[nr / 64] |= 1ULL << (63 - nr % 64);
++	else
++		fac[nr / 64] &= ~(1ULL << (63 - nr % 64));
++}
++
++static void start_at(struct kvm_vcpu *vcpu, const char *label)
++{
++	vcpu->run->psw_mask = PSW_MASK_BA;
++	vcpu->run->psw_addr = gaddr(label);
++}
++
++/* run until the guest leaves through DIAGNOSE 0x501, return its number */
++static int run_to_exit(struct kvm_vcpu *vcpu)
++{
++	struct kvm_run *run = vcpu->run;
++
++	vcpu_run(vcpu);
++	TEST_ASSERT(run->exit_reason == KVM_EXIT_S390_SIEIC &&
++		    run->s390_sieic.icptcode == ICPT_INST &&
++		    (run->s390_sieic.ipa & 0xff0f) == 0x8300 &&
++		    run->s390_sieic.ipb == 0x05010000,
++		    "exit %u icpt 0x%02x ipa 0x%04x ipb 0x%08x psw 0x%016llx 0x%016llx",
++		    run->exit_reason, run->s390_sieic.icptcode,
++		    run->s390_sieic.ipa, run->s390_sieic.ipb,
++		    run->psw_mask, run->psw_addr);
++	return (run->s390_sieic.ipa >> 4) & 0xf;
++}
++
++static void test_interface(void)
++{
++	struct kvm_vm *v = vm_create_barebones();
++	u32 mode = KVM_S390_ARCH_MODE_ESA390_CM;
++	int rc;
++
++	rc = __kvm_device_attr_set(v->fd, KVM_S390_VM_ARCH_MODE,
++				   KVM_S390_VM_ARCH_MODE_CURRENT, &mode);
++	TEST_ASSERT(rc == -1 && errno == ENXIO, "attribute without capability");
++	rc = __vm_enable_cap(v, KVM_CAP_S390_ESA390_CM, 0);
++	TEST_ASSERT(rc == -1 && errno == EINVAL, "capability without USER_SIGP");
++	vm_enable_cap(v, KVM_CAP_S390_USER_SIGP, 0);
++	__vm_vcpu_add(v, 0);
++	rc = __vm_enable_cap(v, KVM_CAP_S390_ESA390_CM, 0);
++	TEST_ASSERT(rc == -1 && errno == EBUSY, "capability after vCPU creation");
++	kvm_vm_free(v);
++	ksft_test_result_pass("capability and attribute are refused when not usable\n");
++}
++
++/*
++ * KVM changes facility bit 2 with the mode and leaves the bits of the CPU
++ * model alone. Bits 138 and 168 are set the way a configuration that offers
++ * the mode has them; user space is responsible for that.
++ */
++static void test_facility_list(void)
++{
++	struct kvm_s390_vm_cpu_processor proc;
++	bool z_before, esa_after, z_again, model_kept;
++
++	TEST_ASSERT_EQ(set_mode(KVM_S390_ARCH_MODE_ZARCH), 0);
++	get_processor(&proc);
++	fac_set(proc.fac_list, FAC_CZAM, false);
++	fac_set(proc.fac_list, FAC_ESA390_CM, true);
++	/* KVM ignores what user space says about bit 2 */
++	fac_set(proc.fac_list, FAC_ZARCH_ACTIVE, false);
++	kvm_device_attr_set(vm->fd, KVM_S390_VM_CPU_MODEL,
++			    KVM_S390_VM_CPU_PROCESSOR, &proc);
++	get_processor(&proc);
++	z_before = fac_test(proc.fac_list, FAC_ZARCH_ACTIVE);
++
++	TEST_ASSERT_EQ(set_mode(KVM_S390_ARCH_MODE_ESA390_CM), 0);
++	get_processor(&proc);
++	esa_after = !fac_test(proc.fac_list, FAC_ZARCH_ACTIVE);
++	model_kept = !fac_test(proc.fac_list, FAC_CZAM) &&
++		     fac_test(proc.fac_list, FAC_ESA390_CM);
++
++	TEST_ASSERT_EQ(set_mode(KVM_S390_ARCH_MODE_ZARCH), 0);
++	get_processor(&proc);
++	z_again = fac_test(proc.fac_list, FAC_ZARCH_ACTIVE);
++	model_kept = model_kept && !fac_test(proc.fac_list, FAC_CZAM) &&
++		     fac_test(proc.fac_list, FAC_ESA390_CM);
++
++	TEST_ASSERT_EQ(set_mode(KVM_S390_ARCH_MODE_ESA390_CM), 0);
++	ksft_test_result(z_before && esa_after && z_again && model_kept,
++			 "facility bit 2 follows the mode, bits 138 and 168 stay as set (%d %d %d %d)\n",
++			 z_before, esa_after, z_again, model_kept);
++}
++
++/* guest debugging cannot be enabled in the mode, nor the mode with it */
++static void test_guest_debug(struct kvm_vcpu *vcpu)
++{
++	struct kvm_guest_debug dbg = {
++		.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP,
++	};
++	struct kvm_guest_debug off = {};
++	int rc, err;
++
++	rc = __vcpu_ioctl(vcpu, KVM_SET_GUEST_DEBUG, &dbg);
++	err = errno;
++	/* fails as well without the guest-PER enhancement */
++	__vcpu_ioctl(vcpu, KVM_SET_GUEST_DEBUG, &off);
++	TEST_ASSERT_EQ(set_mode(KVM_S390_ARCH_MODE_ZARCH), 0);
++	if (__vcpu_ioctl(vcpu, KVM_SET_GUEST_DEBUG, &dbg)) {
++		/* no guest-PER enhancement: no guest debugging in any mode */
++		TEST_ASSERT_EQ(set_mode(KVM_S390_ARCH_MODE_ESA390_CM), 0);
++		ksft_test_result_skip("guest debugging is not available on this host\n");
++		return;
++	}
++	ksft_test_result(rc == -1 && err == EINVAL &&
++			 set_mode(KVM_S390_ARCH_MODE_ESA390_CM) == -EINVAL &&
++			 get_mode() == KVM_S390_ARCH_MODE_ZARCH,
++			 "guest debugging is refused in the mode and blocks entering it\n");
++	vcpu_ioctl(vcpu, KVM_SET_GUEST_DEBUG, &off);
++	TEST_ASSERT_EQ(set_mode(KVM_S390_ARCH_MODE_ESA390_CM), 0);
++}
++
++/* run STORE FACILITY LIST (EXTENDED) and check bit 2 for @esa */
++static void test_stfl(struct kvm_vcpu *vcpu, bool esa)
++{
++	__u64 dw0, dw2;
++	u32 stfl;
++	int n;
++
++	setup_lowcore(mem);
++	start_at(vcpu, g_stfl);
++	n = run_to_exit(vcpu);
++	stfl = rd32(mem, LC_STFL);
++	dw0 = rd64(mem, D_STFLE);
++	dw2 = rd64(mem, D_STFLE + 16);
++	ksft_test_result(n == EXIT_STFL &&
++			 !!(stfl & 0x20000000U) == !esa &&
++			 fac_test(&dw0, FAC_ZARCH_ACTIVE) == !esa &&
++			 !(dw2 & (1ULL << (63 - FAC_CZAM % 64))) &&
++			 (dw2 & (1ULL << (63 - FAC_ESA390_CM % 64))),
++			 "%s: STFL and STFLE show facility bit 2 %s (exit %d, STFL %08x, STFLE %016llx ... %016llx)\n",
++			 esa ? "ESA/390-compatibility mode" : "z/Architecture",
++			 esa ? "zero" : "one", n, stfl, dw0, dw2);
++}
++
++static void test_guest_facilities(struct kvm_vcpu *vcpu)
++{
++	test_stfl(vcpu, true);
++	TEST_ASSERT_EQ(set_mode(KVM_S390_ARCH_MODE_ZARCH), 0);
++	test_stfl(vcpu, false);
++	TEST_ASSERT_EQ(set_mode(KVM_S390_ARCH_MODE_ESA390_CM), 0);
++}
++
++static void test_machine_delivery(struct kvm_vcpu *vcpu)
++{
++	int n;
++
++	setup_lowcore(mem);
++	start_at(vcpu, g_basic);
++	/*
++	 * Nothing tells KVM whether the machine (or the hypervisor this host
++	 * is a guest of) runs a state description without the z/Architecture
++	 * flag. If it does not, it answers the first entry with a validity
++	 * interception and KVM_RUN fails.
++	 */
++	if (__vcpu_run(vcpu) < 0 && errno == EINVAL)
++		ksft_exit_skip("the host does not run ESA/390-format state descriptions\n");
++	setup_lowcore(mem);
++	start_at(vcpu, g_basic);
++	n = run_to_exit(vcpu);
++	TEST_ASSERT_EQ(n, EXIT_SVC);
++	ksft_test_result(rd32(mem, D_EPSW) == ESA_PSW_BIT12 &&
++			 rd32(mem, D_EPSW + 4) == ESA_PSW_AMODE31,
++			 "EXTRACT PSW shows an ESA/390 PSW (%08x %08x)\n",
++			 rd32(mem, D_EPSW), rd32(mem, D_EPSW + 4));
++	ksft_test_result(rd64(mem, ESA_SVC_OLD) == esa_psw(0, gaddr(g_wait)) &&
++			 rd32(mem, LC_SVC_ILC) == 0x00020055 && z_psws_untouched(mem),
++			 "supervisor call: eight-byte old PSW (%016lx), code %08x\n",
++			 rd64(mem, ESA_SVC_OLD), rd32(mem, LC_SVC_ILC));
++	ksft_test_result(vcpu->run->psw_mask == PSW_MASK_BA &&
++			 vcpu->run->psw_addr == gaddr(s_svc) + 4,
++			 "user space sees the 16-byte PSW (%016llx %016llx)\n",
++			 vcpu->run->psw_mask, vcpu->run->psw_addr);
++}
++
++static void test_program(struct kvm_vcpu *vcpu)
++{
++	struct kvm_s390_irq irq = { .type = KVM_S390_PROGRAM_INT };
++	int n;
++
++	/* a PSW with the DAT bit is invalid in the mode */
++	setup_lowcore(mem);
++	start_at(vcpu, g_dat);
++	n = run_to_exit(vcpu);
++	ksft_test_result(n == EXIT_PGM &&
++			 rd64(mem, ESA_PGM_OLD) == esa_psw(ESA_PSW_DAT, gaddr(g_dat) + 4) &&
++			 rd32(mem, LC_PGM_ILC) == 0x00000006 && z_psws_untouched(mem),
++			 "LOAD PSW with the DAT bit: specification exception (exit %d, old PSW %016lx, code %08x)\n",
++			 n, rd64(mem, ESA_PGM_OLD), rd32(mem, LC_PGM_ILC));
++
++	/* operation exception, reflected by KVM */
++	setup_lowcore(mem);
++	start_at(vcpu, g_opc);
++	n = run_to_exit(vcpu);
++	ksft_test_result(n == EXIT_PGM &&
++			 rd64(mem, ESA_PGM_OLD) == esa_psw(0, gaddr(g_opc) + 2) &&
++			 rd32(mem, LC_PGM_ILC) == 0x00020001 && z_psws_untouched(mem),
++			 "operation exception in ESA/390 format (exit %d, old PSW %016lx, code %08x)\n",
++			 n, rd64(mem, ESA_PGM_OLD), rd32(mem, LC_PGM_ILC));
++
++	/* program interruption injected by user space */
++	setup_lowcore(mem);
++	irq.u.pgm.code = 0x0007;
++	vcpu_ioctl(vcpu, KVM_S390_IRQ, &irq);
++	start_at(vcpu, g_basic);
++	n = run_to_exit(vcpu);
++	ksft_test_result(n == EXIT_PGM &&
++			 rd64(mem, ESA_PGM_OLD) == esa_psw(0, gaddr(g_basic)) &&
++			 (rd32(mem, LC_PGM_ILC) & 0xffff) == 0x0007 && z_psws_untouched(mem),
++			 "injected program interruption in ESA/390 format (exit %d, old PSW %016lx, code %08x)\n",
++			 n, rd64(mem, ESA_PGM_OLD), rd32(mem, LC_PGM_ILC));
++}
++
++static void test_kvm_delivery(struct kvm_vcpu *vcpu)
++{
++	u64 wait_psw = esa_psw(ESA_PSW_INT | ESA_PSW_WAIT, 0);
++	struct kvm_s390_interrupt fl = {};
++	struct kvm_s390_irq irq = {};
++	int n;
++
++	/* restart */
++	setup_lowcore(mem);
++	irq.type = KVM_S390_RESTART;
++	vcpu_ioctl(vcpu, KVM_S390_IRQ, &irq);
++	start_at(vcpu, g_wait);
++	n = run_to_exit(vcpu);
++	ksft_test_result(n == EXIT_RST &&
++			 rd64(mem, ESA_RST_OLD) == esa_psw(0, gaddr(g_wait)) &&
++			 z_psws_untouched(mem),
++			 "restart interruption in ESA/390 format (exit %d, old PSW %016lx)\n",
++			 n, rd64(mem, ESA_RST_OLD));
++
++	/* external: emergency signal from CPU 0 */
++	setup_lowcore(mem);
++	memset(&irq, 0, sizeof(irq));
++	irq.type = KVM_S390_INT_EMERGENCY;
++	vcpu_ioctl(vcpu, KVM_S390_IRQ, &irq);
++	start_at(vcpu, g_wait);
++	n = run_to_exit(vcpu);
++	ksft_test_result(n == EXIT_EXT && rd64(mem, ESA_EXT_OLD) == wait_psw &&
++			 rd32(mem, LC_EXT_CPU_ADDR) == 0x00001201 && z_psws_untouched(mem),
++			 "external interruption in ESA/390 format (exit %d, old PSW %016lx, code %08x)\n",
++			 n, rd64(mem, ESA_EXT_OLD), rd32(mem, LC_EXT_CPU_ADDR));
++
++	/* input/output */
++	setup_lowcore(mem);
++	fl.type = KVM_S390_INT_IO(0, 0, 0, 1);
++	fl.parm = 0x00010001;
++	fl.parm64 = 0xdeadbeef00000000ULL;
++	vm_ioctl(vm, KVM_S390_INTERRUPT, &fl);
++	start_at(vcpu, g_wait);
++	n = run_to_exit(vcpu);
++	ksft_test_result(n == EXIT_IO && rd64(mem, ESA_IO_OLD) == wait_psw &&
++			 rd32(mem, LC_SUBCHANNEL) == 0x00010001 &&
++			 rd32(mem, LC_IO_PARM) == 0xdeadbeef && z_psws_untouched(mem),
++			 "I/O interruption in ESA/390 format (exit %d, old PSW %016lx, id %08x)\n",
++			 n, rd64(mem, ESA_IO_OLD), rd32(mem, LC_SUBCHANNEL));
++
++	/* machine check: channel report pending */
++	setup_lowcore(mem);
++	memset(&fl, 0, sizeof(fl));
++	fl.type = KVM_S390_MCHK;
++	fl.parm = 0x10000000;
++	fl.parm64 = 0x00400f1d40330000ULL;
++	vm_ioctl(vm, KVM_S390_INTERRUPT, &fl);
++	start_at(vcpu, g_wait);
++	n = run_to_exit(vcpu);
++	ksft_test_result(n == EXIT_MCK && rd64(mem, ESA_MCK_OLD) == wait_psw &&
++			 rd64(mem, LC_MCCK_CODE) == 0x00400f1d40330000ULL &&
++			 mem[LC_AR_MODE_ID] == 0 &&
++			 rd32(mem, ESA_CREGS_SAVE) == GUEST_CR0,
++			 "machine-check interruption in ESA/390 format (exit %d, old PSW %016lx, code %016lx, saved CR0 %08x)\n",
++			 n, rd64(mem, ESA_MCK_OLD), rd64(mem, LC_MCCK_CODE),
++			 rd32(mem, ESA_CREGS_SAVE));
++}
++
++static void test_prefix(struct kvm_vcpu *vcpu)
++{
++	u8 *alt = mem + alt_prefix;
++	int n;
++
++	setup_lowcore(mem);
++	setup_lowcore(alt);
++	vcpu->run->s.regs.prefix = alt_prefix;
++	vcpu->run->kvm_dirty_regs |= KVM_SYNC_PREFIX;
++	start_at(vcpu, g_opc);
++	n = run_to_exit(vcpu);
++	ksft_test_result(n == EXIT_PGM && vcpu->run->s.regs.prefix == alt_prefix &&
++			 rd64(alt, ESA_PGM_OLD) == esa_psw(0, gaddr(g_opc) + 2) &&
++			 !rd64(mem, ESA_PGM_OLD),
++			 "KVM uses a 4K prefix area at 0x%lx (exit %d, prefix 0x%llx, old PSW %016lx)\n",
++			 alt_prefix, n, vcpu->run->s.regs.prefix,
++			 rd64(alt, ESA_PGM_OLD));
++	vcpu->run->s.regs.prefix = 0;
++	vcpu->run->kvm_dirty_regs |= KVM_SYNC_PREFIX;
++}
++
++static void test_mode_switch(struct kvm_vcpu *vcpu)
++{
++	unsigned long z_prefix = alt_prefix & ~0x1000UL;
++	struct kvm_run *run = vcpu->run;
++	int rc, n;
++
++	setup_lowcore(mem);
++	rc = ioctl(vcpu->fd, KVM_S390_STORE_STATUS, 0x10000UL);
++	TEST_ASSERT(rc == -1 && errno == EINVAL, "KVM_S390_STORE_STATUS in the mode");
++
++	/* the guest gets to SIGP set-architecture, which user space handles */
++	run->s.regs.prefix = alt_prefix;
++	run->kvm_dirty_regs |= KVM_SYNC_PREFIX;
++	setup_lowcore(mem + alt_prefix);
++	start_at(vcpu, g_sigp);
++	vcpu_run(vcpu);
++	TEST_ASSERT(run->exit_reason == KVM_EXIT_S390_SIEIC &&
++		    run->s390_sieic.icptcode == ICPT_INST &&
++		    (run->s390_sieic.ipa & 0xff00) == 0xae00 &&
++		    (run->s390_sieic.ipb >> 16) == 0x0012,
++		    "expected SIGP set-architecture, got exit %u icpt 0x%02x ipa 0x%04x ipb 0x%08x",
++		    run->exit_reason, run->s390_sieic.icptcode,
++		    run->s390_sieic.ipa, run->s390_sieic.ipb);
++	ksft_test_result((rd32(mem + alt_prefix, D_SENSE_RUN) >> 28) == 1 &&
++			 rd32(mem + alt_prefix, D_SENSE_RUN + 4) == SIGP_STATUS_INVALID_ORDER,
++			 "SIGP sense-running-status is an invalid order in the mode (cc %u, status %08x)\n",
++			 rd32(mem + alt_prefix, D_SENSE_RUN) >> 28,
++			 rd32(mem + alt_prefix, D_SENSE_RUN + 4));
++
++	/* what user space does for the order: switch, condition code 0 */
++	TEST_ASSERT_EQ(get_mode(), KVM_S390_ARCH_MODE_ESA390_CM);
++	TEST_ASSERT_EQ(set_mode(KVM_S390_ARCH_MODE_ZARCH), 0);
++	TEST_ASSERT_EQ(get_mode(), KVM_S390_ARCH_MODE_ZARCH);
++	run->psw_mask &= ~PSW_MASK_CC;
++	setup_lowcore(mem + z_prefix);
++	n = run_to_exit(vcpu);
++	ksft_test_result(run->s.regs.prefix == z_prefix,
++			 "the prefix is aligned to 8K in z/Architecture mode (0x%llx)\n",
++			 run->s.regs.prefix);
++	ksft_test_result(n == EXIT_SVC_Z &&
++			 rd64(mem + z_prefix, D_LGHI) == ~0ULL &&
++			 rd32(mem + z_prefix, D_EPSW_Z) == 0 &&
++			 rd64(mem + z_prefix, Z_SVC_OLD) == PSW_MASK_BA &&
++			 rd64(mem + z_prefix, Z_SVC_OLD + 8) == gaddr(g_xcall) &&
++			 !rd64(mem + z_prefix, ESA_SVC_OLD),
++			 "z/Architecture after the switch (exit %d, old PSW %016lx %016lx, EPSW %08x)\n",
++			 n, rd64(mem + z_prefix, Z_SVC_OLD),
++			 rd64(mem + z_prefix, Z_SVC_OLD + 8),
++			 rd32(mem + z_prefix, D_EPSW_Z));
++
++	/* and back, as for a reset that belongs to a load */
++	TEST_ASSERT_EQ(set_mode(KVM_S390_ARCH_MODE_ESA390_CM), 0);
++	run->s.regs.prefix = 0;
++	run->kvm_dirty_regs |= KVM_SYNC_PREFIX;
++	setup_lowcore(mem);
++	start_at(vcpu, g_basic);
++	n = run_to_exit(vcpu);
++	ksft_test_result(n == EXIT_SVC &&
++			 rd64(mem, ESA_SVC_OLD) == esa_psw(0, gaddr(g_wait)),
++			 "back in the ESA/390-compatibility mode (exit %d, old PSW %016lx)\n",
++			 n, rd64(mem, ESA_SVC_OLD));
++}
++
++static void test_two_cpus(struct kvm_vcpu *vcpu0, struct kvm_vcpu *vcpu1)
++{
++	u8 *lc1 = mem + alt_prefix;
++	int n;
++
++	setup_lowcore(mem);
++	setup_lowcore(lc1);
++	vcpu1->run->s.regs.prefix = alt_prefix;
++	vcpu1->run->kvm_dirty_regs |= KVM_SYNC_PREFIX;
++
++	/* CPU 1 has to be operating before it can be signalled */
++	start_at(vcpu1, g_basic);
++	n = run_to_exit(vcpu1);
++	TEST_ASSERT_EQ(n, EXIT_SVC);
++
++	start_at(vcpu0, g_xcall);
++	n = run_to_exit(vcpu0);
++	ksft_test_result(n == EXIT_XCALL && !(rd32(mem, D_XCALL) >> 28) &&
++			 !(rd32(mem, D_XCALL + 4) >> 28),
++			 "SIGP external call and emergency signal to CPU 1 (exit %d, cc %u %u, status %08x)\n",
++			 n, rd32(mem, D_XCALL) >> 28, rd32(mem, D_XCALL + 4) >> 28,
++			 rd32(mem, D_XCALL + 8));
++
++	start_at(vcpu1, g_wait);
++	n = run_to_exit(vcpu1);
++	ksft_test_result(n == EXIT_EXT &&
++			 (rd32(lc1, LC_EXT_CPU_ADDR) == 0x00001201 ||
++			  rd32(lc1, LC_EXT_CPU_ADDR) == 0x00001202) &&
++			 !rd64(mem, ESA_EXT_OLD) && z_psws_untouched(lc1),
++			 "CPU 1 gets the signal in ESA/390 format in its prefix area (exit %d, code %08x)\n",
++			 n, rd32(lc1, LC_EXT_CPU_ADDR));
++}
++
++int main(int argc, char *argv[])
++{
++	struct kvm_vcpu *vcpu0, *vcpu1;
++
++	TEST_REQUIRE(kvm_has_cap(KVM_CAP_S390_ESA390_CM));
++
++	/* the prefix of the second prefix area can be given as argument */
++	if (argc > 1)
++		alt_prefix = strtoul(argv[1], NULL, 16);
++	TEST_ASSERT(alt_prefix >= 0x4000 && !(alt_prefix & 0xfff) &&
++		    alt_prefix < (GUEST_MEM_PAGES - 2) * 0x1000UL,
++		    "unusable prefix 0x%lx", alt_prefix);
++
++	ksft_print_header();
++	ksft_set_plan(23);
++
++	test_interface();
++
++	vm = vm_create_barebones();
++	vm_enable_cap(vm, KVM_CAP_S390_USER_SIGP, 0);
++	vm_enable_cap(vm, KVM_CAP_S390_ESA390_CM, 0);
++	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS, 0, 0,
++				    GUEST_MEM_PAGES, 0);
++	mem = addr_gpa2hva(vm, 0);
++	memcpy(mem + GUEST_CODE, esa_guest_start, esa_guest_end - esa_guest_start);
++
++	TEST_ASSERT_EQ(get_mode(), KVM_S390_ARCH_MODE_ZARCH);
++	TEST_ASSERT_EQ(set_mode(2), -EINVAL);
++	TEST_ASSERT_EQ(set_mode(KVM_S390_ARCH_MODE_ESA390_CM), 0);
++	TEST_ASSERT_EQ(get_mode(), KVM_S390_ARCH_MODE_ESA390_CM);
++	ksft_test_result_pass("the mode can be set before vCPUs exist\n");
++
++	test_facility_list();
++
++	vcpu0 = __vm_vcpu_add(vm, 0);
++	vcpu1 = __vm_vcpu_add(vm, 1);
++
++	test_guest_debug(vcpu0);
++	test_machine_delivery(vcpu0);
++	test_guest_facilities(vcpu0);
++	test_program(vcpu0);
++	test_kvm_delivery(vcpu0);
++	test_prefix(vcpu0);
++	test_two_cpus(vcpu0, vcpu1);
++	test_mode_switch(vcpu0);
++
++	kvm_vm_free(vm);
++	ksft_finished();
++}
+-- 
+2.47.3
+

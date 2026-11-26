@@ -1,0 +1,97 @@
+From d6cf05ba925c93b96238ff122efe996b78efa604 Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
+Date: Thu, 26 Nov 2026 11:05:16 +0100
+Subject: [RFC PATCH 3/4] KVM: s390: Add KVM_S390_ESA390_CM_DAT
+
+Let user space ask for ESA/390 DAT shadowing with a flag in args[0] of
+KVM_CAP_S390_ESA390_CM. Refuse unknown flags.
+---
+ Documentation/virt/kvm/api.rst   | 31 +++++++++++++++++++++++++++----
+ arch/s390/include/uapi/asm/kvm.h |  3 +++
+ arch/s390/kvm/s390/s390.c        |  4 +++-
+ 3 files changed, 33 insertions(+), 5 deletions(-)
+
+diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
+index 2f7310c12689..4bb6bd3612a8 100644
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -9061,10 +9061,10 @@ hpage_2g module parameter is not set to 1, -EINVAL is returned.
+ 
+ :Architectures: s390
+ :Type: vm
+-:Parameters: none
+-:Returns: 0 on success; -EINVAL if KVM_CAP_S390_USER_SIGP is not enabled or
+-          the VM has the KVM_VM_S390_UCONTROL flag set; -EBUSY if vCPUs were
+-          already created for the VM.
++:Parameters: args[0] - flags (KVM_S390_ESA390_CM_DAT)
++:Returns: 0 on success; -EINVAL if KVM_CAP_S390_USER_SIGP is not enabled,
++          the VM has the KVM_VM_S390_UCONTROL flag set or args[0] has an
++          unknown flag; -EBUSY if vCPUs were already created for the VM.
+ 
+ This capability lets the configuration be put into the ESA/390-compatibility
+ mode, the architectural mode in which a machine that otherwise only provides
+@@ -9119,6 +9119,29 @@ While the configuration is in the mode
+   KVM_GUESTDBG_ENABLE returns -EINVAL, and setting the mode returns -EINVAL
+   while guest debugging is enabled for any vCPU.
+ 
++With KVM_S390_ESA390_CM_DAT in args[0], KVM provides ESA/390 dynamic address
++translation for the primary and the home space in the mode, which the machine
++does not: a PSW with the DAT bit is valid, LOAD REAL ADDRESS, INVALIDATE PAGE
++TABLE ENTRY, PURGE TLB, COMPARE AND SWAP AND PURGE, SET ADDRESS SPACE CONTROL
++(FAST) and INSERT ADDRESS SPACE CONTROL work on the guest's ESA/390 segment
++and page tables, space-switch events are recognized, and translation
++exceptions are presented in ESA/390 format. KVM runs translated code on
++shadow tables in host memory; they are not part of the vCPU or VM state and
++need not be migrated. Table origins are used as absolute addresses.
++Translations are kept, like TLB entries, until the guest purges them; an
++invalidation or purge with effect on all CPUs is complete on all vCPUs when
++the instruction completes. SIGP orders are not interpreted by the machine
++for such a VM. TRACE records nothing while translated. KVM_RUN fails with -EOPNOTSUPP while the PSW has the DAT bit
++and
++
++- the address-space control is secondary space or access register, or a
++  SET ADDRESS SPACE CONTROL (FAST) selects one of them, or
++- branch or ASN tracing is enabled in control register 12, or
++- virtual page 0 is translated to a page the guest may not store into, or
++- virtual page 0 is not translated and the guest stored into it other than
++  into locations 0-511 (which gets the translation exception). Fetches from
++  such a page are not detected and return what KVM's page holds.
++
+ 8. Other capabilities.
+ ======================
+ 
+diff --git a/arch/s390/include/uapi/asm/kvm.h b/arch/s390/include/uapi/asm/kvm.h
+index fbbd8fc5acda..6ed6e2747cb9 100644
+--- a/arch/s390/include/uapi/asm/kvm.h
++++ b/arch/s390/include/uapi/asm/kvm.h
+@@ -393,6 +393,9 @@ struct kvm_s390_io_adapter_req {
+ /* kvm attributes for KVM_S390_VM_ARCH_MODE */
+ #define KVM_S390_VM_ARCH_MODE_CURRENT	0
+ 
++/* flags for KVM_CAP_S390_ESA390_CM, args[0] */
++#define KVM_S390_ESA390_CM_DAT		(1ULL << 0)
++
+ /* architectural modes for KVM_S390_VM_ARCH_MODE_CURRENT */
+ #define KVM_S390_ARCH_MODE_ZARCH	0
+ #define KVM_S390_ARCH_MODE_ESA390_CM	1
+diff --git a/arch/s390/kvm/s390/s390.c b/arch/s390/kvm/s390/s390.c
+index 8c965a2defbe..5ecd453c2327 100644
+--- a/arch/s390/kvm/s390/s390.c
++++ b/arch/s390/kvm/s390/s390.c
+@@ -953,10 +953,12 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm, struct kvm_enable_cap *cap)
+ 		mutex_lock(&kvm->lock);
+ 		if (kvm->created_vcpus) {
+ 			r = -EBUSY;
+-		} else if (kvm_is_ucontrol(kvm) || !kvm->arch.user_sigp) {
++		} else if (kvm_is_ucontrol(kvm) || !kvm->arch.user_sigp ||
++			   cap->args[0] & ~KVM_S390_ESA390_CM_DAT) {
+ 			r = -EINVAL;
+ 		} else {
+ 			kvm->arch.esa390_cm = true;
++			kvm->arch.esa390_dat = cap->args[0] & KVM_S390_ESA390_CM_DAT;
+ 			kvm_s390_update_fac_arch_mode(kvm);
+ 			r = 0;
+ 		}
+-- 
+2.47.3
+

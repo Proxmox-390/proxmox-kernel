@@ -1,0 +1,583 @@
+From ad24702309fbce90f0f4f85321de65d53ae25b0b Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
+Date: Wed, 25 Nov 2026 12:40:12 +0100
+Subject: [RFC PATCH 3/7] KVM: s390: Present interruptions in ESA/390 format in
+ the mode
+
+A CPU in the ESA/390-compatibility mode takes interruptions the ESA/390
+way (Principles of Operation, "Assigned Storage Locations" and chapter 6,
+"Interruption Action"): the old and new PSWs are eight bytes long and lie
+at real 0-127 (restart 8/0, external 24/88, supervisor call 32/96, program
+40/104, machine check 48/112, input/output 56/120), and the interruption
+parameters that are wider than four bytes in z/Architecture have their
+ESA/390 places.
+
+The machine presents the interruptions it recognizes inside SIE in that
+format by itself. Make the ones KVM presents follow:
+
+- all places that store an old PSW or fetch a new one go through
+  kvm_s390_lc_store_old_psw(), kvm_s390_lc_read_new_psw() and
+  kvm_s390_lc_load_new_psw(), which map the location and convert the PSW
+  when the vCPU is in the mode. That covers external, input/output and
+  restart interruptions, whose parameters have the same locations in both
+  modes, and the checks of a new PSW in the interception handlers;
+- program interruptions: PER address (152) and monitor code (156) are four
+  bytes long, a protection exception stores its identification at 144, no
+  breaking-event address is stored. Exceptions of dynamic address
+  translation cannot occur;
+- machine checks: architectural-mode identification 0, the CPU timer and
+  clock comparator at 216 and 224, and the register save areas of the
+  first 512 bytes with 32-bit general and control registers and
+  floating-point registers 0, 2, 4 and 6;
+- the interruption parameters of a program interception have the layout
+  of an ESA/390-format state description, with four-byte fields. That
+  layout is what the machine was observed to store; no public document
+  describing it is known;
+- a PSW with the DAT bit or the extended-addressing-mode bit is not valid
+  in the mode, and EXTRACT PSW shows bit 12 as one.
+
+No functional change as long as no vCPU is in the mode.
+
+Assisted-by: Claude:claude-fable-5-2
+Assisted-by: Claude:claude-opus-5-5
+---
+ arch/s390/kvm/s390/intercept.c |  20 ++-
+ arch/s390/kvm/s390/interrupt.c | 293 ++++++++++++++++++++++++++-------
+ arch/s390/kvm/s390/priv.c      |  18 +-
+ arch/s390/kvm/s390/s390.h      |   7 +
+ 4 files changed, 278 insertions(+), 60 deletions(-)
+
+diff --git a/arch/s390/kvm/s390/intercept.c b/arch/s390/kvm/s390/intercept.c
+index ca1205dfac8b..a87aeb3af0fa 100644
+--- a/arch/s390/kvm/s390/intercept.c
++++ b/arch/s390/kvm/s390/intercept.c
+@@ -202,6 +202,18 @@ static int inject_prog_on_prog_intercept(struct kvm_vcpu *vcpu)
+ 		pgm_info.per_address = vcpu->arch.sie_block->peraddr;
+ 		pgm_info.per_access_id = vcpu->arch.sie_block->peraid;
+ 	}
++	if (kvm_s390_vcpu_is_esa(vcpu)) {
++		/*
++		 * ESA/390-format state description: four-byte fields. The
++		 * exception identification shares the word of the
++		 * data-exception code, PER address and monitor code share
++		 * the PER-address doubleword. This is the layout the machine
++		 * was observed to use; it is not taken from a public document.
++		 */
++		pgm_info.trans_exc_code = vcpu->arch.sie_block->dxc;
++		pgm_info.per_address = vcpu->arch.sie_block->peraddr >> 32;
++		pgm_info.mon_code = (u32)vcpu->arch.sie_block->peraddr;
++	}
+ 	return kvm_s390_inject_prog_irq(vcpu, &pgm_info);
+ }
+ 
+@@ -269,11 +281,11 @@ static int handle_prog(struct kvm_vcpu *vcpu)
+ 
+ 	trace_kvm_s390_intercept_prog(vcpu, vcpu->arch.sie_block->iprcc);
+ 	if (vcpu->arch.sie_block->iprcc == PGM_SPECIFICATION) {
+-		rc = read_guest_lc(vcpu, __LC_PGM_NEW_PSW, &psw, sizeof(psw_t));
++		rc = kvm_s390_lc_read_new_psw(vcpu, __LC_PGM_NEW_PSW, &psw);
+ 		if (rc)
+ 			return rc;
+ 		/* Avoid endless loops of specification exceptions */
+-		if (!is_valid_psw(&psw))
++		if (!kvm_s390_is_valid_psw(vcpu, &psw))
+ 			return -EOPNOTSUPP;
+ 	}
+ 	rc = handle_itdb(vcpu);
+@@ -312,7 +324,7 @@ static int handle_external_interrupt(struct kvm_vcpu *vcpu)
+ 	if (kvm_s390_pv_cpu_is_protected(vcpu)) {
+ 		newpsw = vcpu->arch.sie_block->gpsw;
+ 	} else {
+-		rc = read_guest_lc(vcpu, __LC_EXT_NEW_PSW, &newpsw, sizeof(psw_t));
++		rc = kvm_s390_lc_read_new_psw(vcpu, __LC_EXT_NEW_PSW, &newpsw);
+ 		if (rc)
+ 			return rc;
+ 	}
+@@ -483,7 +495,7 @@ static int handle_operexc(struct kvm_vcpu *vcpu)
+ 
+ 	if (vcpu->arch.sie_block->ipa == 0 && vcpu->kvm->arch.user_instr0)
+ 		return -EOPNOTSUPP;
+-	rc = read_guest_lc(vcpu, __LC_PGM_NEW_PSW, &newpsw, sizeof(psw_t));
++	rc = kvm_s390_lc_read_new_psw(vcpu, __LC_PGM_NEW_PSW, &newpsw);
+ 	if (rc)
+ 		return rc;
+ 	/*
+diff --git a/arch/s390/kvm/s390/interrupt.c b/arch/s390/kvm/s390/interrupt.c
+index f892f4307883..5877a8dcf626 100644
+--- a/arch/s390/kvm/s390/interrupt.c
++++ b/arch/s390/kvm/s390/interrupt.c
+@@ -443,6 +443,105 @@ static void set_intercept_indicators(struct kvm_vcpu *vcpu)
+ 	set_intercept_indicators_stop(vcpu);
+ }
+ 
++/*
++ * Low storage of a CPU in the ESA/390-compatibility mode, where it differs
++ * from z/Architecture: the assigned storage locations of ESA/390. The old
++ * and new PSWs are eight bytes long, the register save areas lie in the
++ * first 512 bytes and hold 32-bit general and control registers.
++ */
++#define ESA_LC_RST_NEW_PSW		0
++#define ESA_LC_RST_OLD_PSW		8
++#define ESA_LC_EXT_OLD_PSW		24
++#define ESA_LC_SVC_OLD_PSW		32
++#define ESA_LC_PGM_OLD_PSW		40
++#define ESA_LC_MCK_OLD_PSW		48
++#define ESA_LC_IO_OLD_PSW		56
++#define ESA_LC_EXT_NEW_PSW		88
++#define ESA_LC_SVC_NEW_PSW		96
++#define ESA_LC_PGM_NEW_PSW		104
++#define ESA_LC_MCK_NEW_PSW		112
++#define ESA_LC_IO_NEW_PSW		120
++#define ESA_LC_PGM_EXC_ID		144
++#define ESA_LC_PER_ADDRESS		152
++#define ESA_LC_MON_CODE			156
++#define ESA_LC_CPU_TIMER_SAVE_AREA	216
++#define ESA_LC_CLOCK_COMP_SAVE_AREA	224
++#define ESA_LC_EXT_DAMAGE_CODE		244
++#define ESA_LC_MCCK_FAIL_STOR_ADDR	248
++#define ESA_LC_AREGS_SAVE_AREA		288
++#define ESA_LC_FPREGS_SAVE_AREA		352
++#define ESA_LC_GPREGS_SAVE_AREA		384
++#define ESA_LC_CREGS_SAVE_AREA		448
++
++/*
++ * The callers name the z/Architecture location of an old or new PSW; map it
++ * to the location the PSW has in the ESA/390-compatibility mode.
++ */
++static unsigned long lc_esa_psw_addr(unsigned long lc_addr)
++{
++	switch (lc_addr) {
++	case __LC_RST_NEW_PSW:
++		return ESA_LC_RST_NEW_PSW;
++	case __LC_RST_OLD_PSW:
++		return ESA_LC_RST_OLD_PSW;
++	case __LC_EXT_OLD_PSW:
++		return ESA_LC_EXT_OLD_PSW;
++	case __LC_SVC_OLD_PSW:
++		return ESA_LC_SVC_OLD_PSW;
++	case __LC_PGM_OLD_PSW:
++		return ESA_LC_PGM_OLD_PSW;
++	case __LC_MCK_OLD_PSW:
++		return ESA_LC_MCK_OLD_PSW;
++	case __LC_IO_OLD_PSW:
++		return ESA_LC_IO_OLD_PSW;
++	case __LC_EXT_NEW_PSW:
++		return ESA_LC_EXT_NEW_PSW;
++	case __LC_SVC_NEW_PSW:
++		return ESA_LC_SVC_NEW_PSW;
++	case __LC_PGM_NEW_PSW:
++		return ESA_LC_PGM_NEW_PSW;
++	case __LC_MCK_NEW_PSW:
++		return ESA_LC_MCK_NEW_PSW;
++	case __LC_IO_NEW_PSW:
++		return ESA_LC_IO_NEW_PSW;
++	}
++	WARN_ON_ONCE(1);
++	return lc_addr;
++}
++
++int kvm_s390_lc_store_old_psw(struct kvm_vcpu *vcpu, unsigned long lc_addr)
++{
++	u64 esa;
++
++	if (!kvm_s390_vcpu_is_esa(vcpu))
++		return write_guest_lc(vcpu, lc_addr,
++				      &vcpu->arch.sie_block->gpsw,
++				      sizeof(psw_t));
++	esa = kvm_s390_psw_to_esa(&vcpu->arch.sie_block->gpsw);
++	return write_guest_lc(vcpu, lc_esa_psw_addr(lc_addr), &esa,
++			      sizeof(esa));
++}
++
++int kvm_s390_lc_read_new_psw(struct kvm_vcpu *vcpu, unsigned long lc_addr,
++			     psw_t *psw)
++{
++	u64 esa;
++	int rc;
++
++	if (!kvm_s390_vcpu_is_esa(vcpu))
++		return read_guest_lc(vcpu, lc_addr, psw, sizeof(psw_t));
++	rc = read_guest_lc(vcpu, lc_esa_psw_addr(lc_addr), &esa, sizeof(esa));
++	if (!rc)
++		kvm_s390_psw_from_esa(psw, esa);
++	return rc;
++}
++
++int kvm_s390_lc_load_new_psw(struct kvm_vcpu *vcpu, unsigned long lc_addr)
++{
++	return kvm_s390_lc_read_new_psw(vcpu, lc_addr,
++					&vcpu->arch.sie_block->gpsw);
++}
++
+ static int __must_check __deliver_cpu_timer(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+@@ -458,10 +557,8 @@ static int __must_check __deliver_cpu_timer(struct kvm_vcpu *vcpu)
+ 		rc  = put_guest_lc(vcpu, EXT_IRQ_CPU_TIMER,
+ 				   (u16 *)__LC_EXT_INT_CODE);
+ 		rc |= put_guest_lc(vcpu, 0, (u16 *)__LC_EXT_CPU_ADDR);
+-		rc |= write_guest_lc(vcpu, __LC_EXT_OLD_PSW,
+-				     &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
+-		rc |= read_guest_lc(vcpu, __LC_EXT_NEW_PSW,
+-				    &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
++		rc |= kvm_s390_lc_store_old_psw(vcpu, __LC_EXT_OLD_PSW);
++		rc |= kvm_s390_lc_load_new_psw(vcpu, __LC_EXT_NEW_PSW);
+ 	}
+ 	clear_bit(IRQ_PEND_EXT_CPU_TIMER, &li->pending_irqs);
+ 	return rc ? -EFAULT : 0;
+@@ -482,10 +579,8 @@ static int __must_check __deliver_ckc(struct kvm_vcpu *vcpu)
+ 		rc  = put_guest_lc(vcpu, EXT_IRQ_CLK_COMP,
+ 				   (u16 __user *)__LC_EXT_INT_CODE);
+ 		rc |= put_guest_lc(vcpu, 0, (u16 *)__LC_EXT_CPU_ADDR);
+-		rc |= write_guest_lc(vcpu, __LC_EXT_OLD_PSW,
+-				     &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
+-		rc |= read_guest_lc(vcpu, __LC_EXT_NEW_PSW,
+-				    &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
++		rc |= kvm_s390_lc_store_old_psw(vcpu, __LC_EXT_OLD_PSW);
++		rc |= kvm_s390_lc_load_new_psw(vcpu, __LC_EXT_NEW_PSW);
+ 	}
+ 	clear_bit(IRQ_PEND_EXT_CLOCK_COMP, &li->pending_irqs);
+ 	return rc ? -EFAULT : 0;
+@@ -511,14 +606,58 @@ static int __must_check __deliver_pfault_init(struct kvm_vcpu *vcpu)
+ 
+ 	rc  = put_guest_lc(vcpu, EXT_IRQ_CP_SERVICE, (u16 *) __LC_EXT_INT_CODE);
+ 	rc |= put_guest_lc(vcpu, PFAULT_INIT, (u16 *) __LC_EXT_CPU_ADDR);
+-	rc |= write_guest_lc(vcpu, __LC_EXT_OLD_PSW,
+-			     &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
+-	rc |= read_guest_lc(vcpu, __LC_EXT_NEW_PSW,
+-			    &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
++	rc |= kvm_s390_lc_store_old_psw(vcpu, __LC_EXT_OLD_PSW);
++	rc |= kvm_s390_lc_load_new_psw(vcpu, __LC_EXT_NEW_PSW);
+ 	rc |= put_guest_lc(vcpu, ext.ext_params2, (u64 *) __LC_EXT_PARAMS2);
+ 	return rc ? -EFAULT : 0;
+ }
+ 
++/*
++ * Machine-check interruption in the ESA/390-compatibility mode: the save
++ * areas lie in the first 512 bytes and hold the 32-bit registers. The
++ * extended save area (floating-point registers 0-15) is not stored.
++ */
++static int __write_machine_check_esa(struct kvm_vcpu *vcpu,
++				     struct kvm_s390_mchk_info *mchk,
++				     union mci mci)
++{
++	freg_t fprs[NUM_FPRS];
++	u32 regs[16];
++	int rc, i;
++
++	mci.vr = 0;
++	mci.gs = 0;
++	rc = put_guest_lc(vcpu, 0, (u8 __user *)__LC_AR_MODE_ID);
++	rc |= kvm_s390_lc_store_old_psw(vcpu, __LC_MCK_OLD_PSW);
++	rc |= kvm_s390_lc_load_new_psw(vcpu, __LC_MCK_NEW_PSW);
++	rc |= put_guest_lc(vcpu, mci.val, (u64 __user *)__LC_MCCK_CODE);
++
++	rc |= put_guest_lc(vcpu, kvm_s390_get_cpu_timer(vcpu),
++			   (u64 __user *)ESA_LC_CPU_TIMER_SAVE_AREA);
++	rc |= put_guest_lc(vcpu, vcpu->arch.sie_block->ckc,
++			   (u64 __user *)ESA_LC_CLOCK_COMP_SAVE_AREA);
++	rc |= put_guest_lc(vcpu, mchk->ext_damage_code,
++			   (u32 __user *)ESA_LC_EXT_DAMAGE_CODE);
++	rc |= put_guest_lc(vcpu, (u32)mchk->failing_storage_address,
++			   (u32 __user *)ESA_LC_MCCK_FAIL_STOR_ADDR);
++	rc |= write_guest_lc(vcpu, ESA_LC_AREGS_SAVE_AREA,
++			     &vcpu->run->s.regs.acrs, 64);
++	if (cpu_has_vx())
++		convert_vx_to_fp(fprs, (__vector128 *)vcpu->run->s.regs.vrs);
++	else
++		memcpy(fprs, vcpu->run->s.regs.fprs, sizeof(fprs));
++	for (i = 0; i < 4; i++)
++		rc |= write_guest_lc(vcpu, ESA_LC_FPREGS_SAVE_AREA + 8 * i,
++				     &fprs[2 * i], 8);
++	for (i = 0; i < 16; i++)
++		regs[i] = (u32)vcpu->run->s.regs.gprs[i];
++	rc |= write_guest_lc(vcpu, ESA_LC_GPREGS_SAVE_AREA, regs, 64);
++	for (i = 0; i < 16; i++)
++		regs[i] = (u32)vcpu->arch.sie_block->gcr[i];
++	rc |= write_guest_lc(vcpu, ESA_LC_CREGS_SAVE_AREA, regs, 64);
++	return rc ? -EFAULT : 0;
++}
++
+ static int __write_machine_check(struct kvm_vcpu *vcpu,
+ 				 struct kvm_s390_mchk_info *mchk)
+ {
+@@ -590,12 +729,13 @@ static int __write_machine_check(struct kvm_vcpu *vcpu,
+ 		mci.gs = 0;
+ 	}
+ 
++	if (kvm_s390_vcpu_is_esa(vcpu))
++		return __write_machine_check_esa(vcpu, mchk, mci);
++
+ 	/* General interruption information */
+ 	rc |= put_guest_lc(vcpu, 1, (u8 __user *) __LC_AR_MODE_ID);
+-	rc |= write_guest_lc(vcpu, __LC_MCK_OLD_PSW,
+-			     &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
+-	rc |= read_guest_lc(vcpu, __LC_MCK_NEW_PSW,
+-			    &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
++	rc |= kvm_s390_lc_store_old_psw(vcpu, __LC_MCK_OLD_PSW);
++	rc |= kvm_s390_lc_load_new_psw(vcpu, __LC_MCK_NEW_PSW);
+ 	rc |= put_guest_lc(vcpu, mci.val, (u64 __user *) __LC_MCCK_CODE);
+ 
+ 	/* Register-save areas */
+@@ -695,11 +835,8 @@ static int __must_check __deliver_restart(struct kvm_vcpu *vcpu)
+ 	if (kvm_s390_pv_cpu_is_protected(vcpu)) {
+ 		vcpu->arch.sie_block->iictl = IICTL_CODE_RESTART;
+ 	} else {
+-		rc  = write_guest_lc(vcpu,
+-				     offsetof(struct lowcore, restart_old_psw),
+-				     &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
+-		rc |= read_guest_lc(vcpu, offsetof(struct lowcore, restart_psw),
+-				    &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
++		rc  = kvm_s390_lc_store_old_psw(vcpu, __LC_RST_OLD_PSW);
++		rc |= kvm_s390_lc_load_new_psw(vcpu, __LC_RST_NEW_PSW);
+ 	}
+ 	clear_bit(IRQ_PEND_RESTART, &li->pending_irqs);
+ 	return rc ? -EFAULT : 0;
+@@ -752,10 +889,8 @@ static int __must_check __deliver_emergency_signal(struct kvm_vcpu *vcpu)
+ 	rc  = put_guest_lc(vcpu, EXT_IRQ_EMERGENCY_SIG,
+ 			   (u16 *)__LC_EXT_INT_CODE);
+ 	rc |= put_guest_lc(vcpu, cpu_addr, (u16 *)__LC_EXT_CPU_ADDR);
+-	rc |= write_guest_lc(vcpu, __LC_EXT_OLD_PSW,
+-			     &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
+-	rc |= read_guest_lc(vcpu, __LC_EXT_NEW_PSW,
+-			    &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
++	rc |= kvm_s390_lc_store_old_psw(vcpu, __LC_EXT_OLD_PSW);
++	rc |= kvm_s390_lc_load_new_psw(vcpu, __LC_EXT_NEW_PSW);
+ 	return rc ? -EFAULT : 0;
+ }
+ 
+@@ -786,10 +921,8 @@ static int __must_check __deliver_external_call(struct kvm_vcpu *vcpu)
+ 	rc  = put_guest_lc(vcpu, EXT_IRQ_EXTERNAL_CALL,
+ 			   (u16 *)__LC_EXT_INT_CODE);
+ 	rc |= put_guest_lc(vcpu, extcall.code, (u16 *)__LC_EXT_CPU_ADDR);
+-	rc |= write_guest_lc(vcpu, __LC_EXT_OLD_PSW,
+-			     &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
+-	rc |= read_guest_lc(vcpu, __LC_EXT_NEW_PSW, &vcpu->arch.sie_block->gpsw,
+-			    sizeof(psw_t));
++	rc |= kvm_s390_lc_store_old_psw(vcpu, __LC_EXT_OLD_PSW);
++	rc |= kvm_s390_lc_load_new_psw(vcpu, __LC_EXT_NEW_PSW);
+ 	return rc ? -EFAULT : 0;
+ }
+ 
+@@ -808,6 +941,69 @@ static int __deliver_prog_pv(struct kvm_vcpu *vcpu, u16 code)
+ 	return 0;
+ }
+ 
++/*
++ * Program interruption in the ESA/390-compatibility mode. Dynamic address
++ * translation and access-register translation do not exist in the mode, so
++ * only the exceptions that can occur with DAT off need their information:
++ * low storage has the ESA/390 layout (four-byte PER address, monitor code
++ * and protection-exception identification; no breaking-event address).
++ */
++static int __must_check __deliver_prog_esa(struct kvm_vcpu *vcpu,
++					   struct kvm_s390_pgm_info *pgm_info)
++{
++	u16 ilen = pgm_info->flags & KVM_S390_PGM_FLAGS_ILC_MASK;
++	bool nullifying = false;
++	int rc = 0;
++
++	switch (pgm_info->code & ~PGM_PER) {
++	case PGM_MONITOR:
++		rc = put_guest_lc(vcpu, pgm_info->mon_class_nr,
++				  (u16 *)__LC_MON_CLASS_NR);
++		rc |= put_guest_lc(vcpu, (u32)pgm_info->mon_code,
++				   (u32 *)ESA_LC_MON_CODE);
++		break;
++	case PGM_DATA:
++		rc = put_guest_lc(vcpu, pgm_info->data_exc_code,
++				  (u32 *)ESA_LC_PGM_EXC_ID);
++		break;
++	case PGM_PROTECTION:
++		rc = put_guest_lc(vcpu, (u32)pgm_info->trans_exc_code,
++				  (u32 *)ESA_LC_PGM_EXC_ID);
++		rc |= put_guest_lc(vcpu, pgm_info->exc_access_id,
++				   (u8 *)__LC_EXC_ACCESS_ID);
++		break;
++	case PGM_STACK_FULL:
++	case PGM_STACK_EMPTY:
++	case PGM_STACK_SPECIFICATION:
++	case PGM_STACK_TYPE:
++	case PGM_STACK_OPERATION:
++	case PGM_TRACE_TABEL:
++	case PGM_CRYPTO_OPERATION:
++		nullifying = true;
++		break;
++	}
++
++	if (pgm_info->code & PGM_PER) {
++		rc |= put_guest_lc(vcpu, pgm_info->per_code,
++				   (u8 *)__LC_PER_CODE);
++		rc |= put_guest_lc(vcpu, pgm_info->per_atmid,
++				   (u8 *)__LC_PER_ATMID);
++		rc |= put_guest_lc(vcpu, (u32)pgm_info->per_address,
++				   (u32 *)ESA_LC_PER_ADDRESS);
++		rc |= put_guest_lc(vcpu, pgm_info->per_access_id,
++				   (u8 *)__LC_PER_ACCESS_ID);
++	}
++
++	if (nullifying && !(pgm_info->flags & KVM_S390_PGM_FLAGS_NO_REWIND))
++		kvm_s390_rewind_psw(vcpu, ilen);
++
++	rc |= put_guest_lc(vcpu, ilen, (u16 *)__LC_PGM_ILC);
++	rc |= put_guest_lc(vcpu, pgm_info->code, (u16 *)__LC_PGM_CODE);
++	rc |= kvm_s390_lc_store_old_psw(vcpu, __LC_PGM_OLD_PSW);
++	rc |= kvm_s390_lc_load_new_psw(vcpu, __LC_PGM_NEW_PSW);
++	return rc ? -EFAULT : 0;
++}
++
+ static int __must_check __deliver_prog(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+@@ -832,6 +1028,9 @@ static int __must_check __deliver_prog(struct kvm_vcpu *vcpu)
+ 	if (kvm_s390_pv_cpu_is_protected(vcpu))
+ 		return __deliver_prog_pv(vcpu, pgm_info.code & ~PGM_PER);
+ 
++	if (kvm_s390_vcpu_is_esa(vcpu))
++		return __deliver_prog_esa(vcpu, &pgm_info);
++
+ 	switch (pgm_info.code & ~PGM_PER) {
+ 	case PGM_AFX_TRANSLATION:
+ 	case PGM_ASX_TRANSLATION:
+@@ -919,10 +1118,8 @@ static int __must_check __deliver_prog(struct kvm_vcpu *vcpu)
+ 	rc |= put_guest_lc(vcpu, vcpu->arch.sie_block->gbea,
+ 				 (u64 *) __LC_PGM_LAST_BREAK);
+ 	rc |= put_guest_lc(vcpu, pgm_info.code, (u16 *)__LC_PGM_CODE);
+-	rc |= write_guest_lc(vcpu, __LC_PGM_OLD_PSW,
+-			     &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
+-	rc |= read_guest_lc(vcpu, __LC_PGM_NEW_PSW,
+-			    &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
++	rc |= kvm_s390_lc_store_old_psw(vcpu, __LC_PGM_OLD_PSW);
++	rc |= kvm_s390_lc_load_new_psw(vcpu, __LC_PGM_NEW_PSW);
+ 	return rc ? -EFAULT : 0;
+ }
+ 
+@@ -942,10 +1139,8 @@ static int write_sclp(struct kvm_vcpu *vcpu, u32 parm)
+ 
+ 	rc  = put_guest_lc(vcpu, EXT_IRQ_SERVICE_SIG, (u16 *)__LC_EXT_INT_CODE);
+ 	rc |= put_guest_lc(vcpu, 0, (u16 *)__LC_EXT_CPU_ADDR);
+-	rc |= write_guest_lc(vcpu, __LC_EXT_OLD_PSW,
+-			     &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
+-	rc |= read_guest_lc(vcpu, __LC_EXT_NEW_PSW,
+-			    &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
++	rc |= kvm_s390_lc_store_old_psw(vcpu, __LC_EXT_OLD_PSW);
++	rc |= kvm_s390_lc_load_new_psw(vcpu, __LC_EXT_NEW_PSW);
+ 	rc |= put_guest_lc(vcpu, parm,
+ 			   (u32 *)__LC_EXT_PARAMS);
+ 
+@@ -1039,12 +1234,8 @@ static int __must_check __deliver_pfault_done(struct kvm_vcpu *vcpu)
+ 				(u16 *)__LC_EXT_INT_CODE);
+ 		rc |= put_guest_lc(vcpu, PFAULT_DONE,
+ 				(u16 *)__LC_EXT_CPU_ADDR);
+-		rc |= write_guest_lc(vcpu, __LC_EXT_OLD_PSW,
+-				&vcpu->arch.sie_block->gpsw,
+-				sizeof(psw_t));
+-		rc |= read_guest_lc(vcpu, __LC_EXT_NEW_PSW,
+-				&vcpu->arch.sie_block->gpsw,
+-				sizeof(psw_t));
++		rc |= kvm_s390_lc_store_old_psw(vcpu, __LC_EXT_OLD_PSW);
++		rc |= kvm_s390_lc_load_new_psw(vcpu, __LC_EXT_NEW_PSW);
+ 		rc |= put_guest_lc(vcpu, inti->ext.ext_params2,
+ 				(u64 *)__LC_EXT_PARAMS2);
+ 		kfree(inti);
+@@ -1084,12 +1275,8 @@ static int __must_check __deliver_virtio(struct kvm_vcpu *vcpu)
+ 				(u16 *)__LC_EXT_INT_CODE);
+ 		rc |= put_guest_lc(vcpu, VIRTIO_PARAM,
+ 				(u16 *)__LC_EXT_CPU_ADDR);
+-		rc |= write_guest_lc(vcpu, __LC_EXT_OLD_PSW,
+-				&vcpu->arch.sie_block->gpsw,
+-				sizeof(psw_t));
+-		rc |= read_guest_lc(vcpu, __LC_EXT_NEW_PSW,
+-				&vcpu->arch.sie_block->gpsw,
+-				sizeof(psw_t));
++		rc |= kvm_s390_lc_store_old_psw(vcpu, __LC_EXT_OLD_PSW);
++		rc |= kvm_s390_lc_load_new_psw(vcpu, __LC_EXT_NEW_PSW);
+ 		rc |= put_guest_lc(vcpu, inti->ext.ext_params,
+ 				(u32 *)__LC_EXT_PARAMS);
+ 		rc |= put_guest_lc(vcpu, inti->ext.ext_params2,
+@@ -1116,12 +1303,8 @@ static int __do_deliver_io(struct kvm_vcpu *vcpu, struct kvm_s390_io_info *io)
+ 	rc |= put_guest_lc(vcpu, io->subchannel_nr, (u16 *)__LC_SUBCHANNEL_NR);
+ 	rc |= put_guest_lc(vcpu, io->io_int_parm, (u32 *)__LC_IO_INT_PARM);
+ 	rc |= put_guest_lc(vcpu, io->io_int_word, (u32 *)__LC_IO_INT_WORD);
+-	rc |= write_guest_lc(vcpu, __LC_IO_OLD_PSW,
+-			     &vcpu->arch.sie_block->gpsw,
+-			     sizeof(psw_t));
+-	rc |= read_guest_lc(vcpu, __LC_IO_NEW_PSW,
+-			    &vcpu->arch.sie_block->gpsw,
+-			    sizeof(psw_t));
++	rc |= kvm_s390_lc_store_old_psw(vcpu, __LC_IO_OLD_PSW);
++	rc |= kvm_s390_lc_load_new_psw(vcpu, __LC_IO_NEW_PSW);
+ 	return rc ? -EFAULT : 0;
+ }
+ 
+diff --git a/arch/s390/kvm/s390/priv.c b/arch/s390/kvm/s390/priv.c
+index 139386a7475c..5b827c2f9a60 100644
+--- a/arch/s390/kvm/s390/priv.c
++++ b/arch/s390/kvm/s390/priv.c
+@@ -714,6 +714,19 @@ int is_valid_psw(psw_t *psw)
+ 	return 1;
+ }
+ 
++/*
++ * Validity of a PSW (in the 16-byte format) for the mode the vCPU is in.
++ * The ESA/390-compatibility mode knows neither dynamic address translation
++ * nor the 64-bit addressing mode.
++ */
++int kvm_s390_is_valid_psw(struct kvm_vcpu *vcpu, psw_t *psw)
++{
++	if (kvm_s390_vcpu_is_esa(vcpu) &&
++	    (psw->mask & (PSW_MASK_DAT | PSW_MASK_EA)))
++		return 0;
++	return is_valid_psw(psw);
++}
++
+ int kvm_s390_handle_lpsw(struct kvm_vcpu *vcpu)
+ {
+ 	psw_t *gpsw = &vcpu->arch.sie_block->gpsw;
+@@ -740,7 +753,7 @@ int kvm_s390_handle_lpsw(struct kvm_vcpu *vcpu)
+ 	gpsw->mask = (new_psw.mask & ~PSW32_MASK_BASE) << 32;
+ 	gpsw->mask |= new_psw.addr & PSW32_ADDR_AMODE;
+ 	gpsw->addr = new_psw.addr & ~PSW32_ADDR_AMODE;
+-	if (!is_valid_psw(gpsw))
++	if (!kvm_s390_is_valid_psw(vcpu, gpsw))
+ 		return kvm_s390_inject_program_int(vcpu, PGM_SPECIFICATION);
+ 	vcpu->arch.sie_block->gbea = iaddr;
+ 	return 0;
+@@ -1026,6 +1039,9 @@ static int handle_epsw(struct kvm_vcpu *vcpu)
+ 	/* This basically extracts the mask half of the psw. */
+ 	vcpu->run->s.regs.gprs[reg1] &= 0xffffffff00000000UL;
+ 	vcpu->run->s.regs.gprs[reg1] |= vcpu->arch.sie_block->gpsw.mask >> 32;
++	/* bit 12 of the PSW is one in the ESA/390-compatibility mode */
++	if (kvm_s390_vcpu_is_esa(vcpu))
++		vcpu->run->s.regs.gprs[reg1] |= PSW_ESA_BIT12 >> 32;
+ 	if (reg2) {
+ 		vcpu->run->s.regs.gprs[reg2] &= 0xffffffff00000000UL;
+ 		vcpu->run->s.regs.gprs[reg2] |=
+diff --git a/arch/s390/kvm/s390/s390.h b/arch/s390/kvm/s390/s390.h
+index 1ae9f0097285..2fb412c1d3f8 100644
+--- a/arch/s390/kvm/s390/s390.h
++++ b/arch/s390/kvm/s390/s390.h
+@@ -454,6 +454,12 @@ int kvm_s390_reinject_io_int(struct kvm *kvm,
+ 			     struct kvm_s390_interrupt_info *inti);
+ int kvm_s390_mask_adapter(struct kvm *kvm, unsigned int id, bool masked);
+ 
++/* implemented in interrupt.c: old and new PSWs in the format of the mode */
++int kvm_s390_lc_store_old_psw(struct kvm_vcpu *vcpu, unsigned long lc_addr);
++int kvm_s390_lc_read_new_psw(struct kvm_vcpu *vcpu, unsigned long lc_addr,
++			     psw_t *psw);
++int kvm_s390_lc_load_new_psw(struct kvm_vcpu *vcpu, unsigned long lc_addr);
++
+ /* implemented in intercept.c */
+ u8 kvm_s390_get_ilen(struct kvm_vcpu *vcpu);
+ int kvm_handle_sie_intercept(struct kvm_vcpu *vcpu);
+@@ -478,6 +484,7 @@ int handle_sthyi(struct kvm_vcpu *vcpu);
+ 
+ /* implemented in priv.c */
+ int is_valid_psw(psw_t *psw);
++int kvm_s390_is_valid_psw(struct kvm_vcpu *vcpu, psw_t *psw);
+ int kvm_s390_handle_aa(struct kvm_vcpu *vcpu);
+ int kvm_s390_handle_b2(struct kvm_vcpu *vcpu);
+ int kvm_s390_handle_e3(struct kvm_vcpu *vcpu);
+-- 
+2.47.3
+

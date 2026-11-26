@@ -1,3 +1,14 @@
+proxmox-kernel-7.3 (7.3.6-1+s390x6) trixie; urgency=medium
+
+  * KVM: s390: ESA/390-compatibility mode for first-level guests
+    (capability KVM_CAP_S390_ESA390_CM, VM attribute
+    KVM_S390_VM_ARCH_MODE) and ESA/390 DAT shadowing (flag
+    KVM_S390_ESA390_CM_DAT): guests that IPL in ESA/390 can run under
+    KVM, including with dynamic address translation in the primary
+    space; with selftests. Opt-in per VM, no change for other guests.
+
+ -- Yvan Janssens <yvanj@cyber.gent>  Thu, 26 Nov 2026 15:20:47 +0000
+
 proxmox-kernel-7.3 (7.3.6-1+s390x5) trixie; urgency=medium
 
   * s390x: enable legacy ebtables (ebtables module with the filter, nat

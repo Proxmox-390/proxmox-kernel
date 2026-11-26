@@ -1,0 +1,1087 @@
+From 4e51c436fb0ef9947997138f1e610fed552014f9 Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
+Date: Thu, 26 Nov 2026 11:05:16 +0100
+Subject: [RFC PATCH 4/4] KVM: s390: selftests: Add a test for ESA/390 DAT
+ shadowing
+
+Check LOAD REAL ADDRESS with DAT off and on, translation, translation and
+protection exceptions, the purges, the system-mask instructions, SVC and
+LPSW, a clock-comparator interruption of a translated loop, a wait PSW with
+an odd address loaded by LPSW, the home
+space with SAC, SACF and IAC, the space-switch event, the refusal of the
+secondary space, two vCPUs with different prefixes, IPTE and the CSP
+purge on one vCPU seen by another one reading the page, also while it
+switches between two spaces sharing the page table, IPTE of a page
+prefixing moved, SIGP emergency signal to a translated vCPU, the bound on
+the number of shadows, a guest page 0 that is not translated, also
+when it becomes valid while its space is not in use, table
+changes by the guest, that guest storage does not hold anything of the
+shadow, and the switch to z/Architecture.
+---
+ tools/testing/selftests/kvm/Makefile.kvm      |    1 +
+ .../selftests/kvm/s390/esa390_dat_test.c      | 1041 +++++++++++++++++
+ 2 files changed, 1042 insertions(+)
+ create mode 100644 tools/testing/selftests/kvm/s390/esa390_dat_test.c
+
+diff --git a/tools/testing/selftests/kvm/Makefile.kvm b/tools/testing/selftests/kvm/Makefile.kvm
+index ff9f9740b904..9041acc15fea 100644
+--- a/tools/testing/selftests/kvm/Makefile.kvm
++++ b/tools/testing/selftests/kvm/Makefile.kvm
+@@ -222,6 +222,7 @@ TEST_GEN_PROGS_s390 += s390/user_operexec
+ TEST_GEN_PROGS_s390 += s390/keyop
+ TEST_GEN_PROGS_s390 += s390/vsie_esa_test
+ TEST_GEN_PROGS_s390 += s390/esa390_cm_test
++TEST_GEN_PROGS_s390 += s390/esa390_dat_test
+ TEST_GEN_PROGS_s390 += rseq_test
+ TEST_GEN_PROGS_s390 += s390/irq_routing
+ TEST_GEN_PROGS_s390 += mmu_stress_test
+diff --git a/tools/testing/selftests/kvm/s390/esa390_dat_test.c b/tools/testing/selftests/kvm/s390/esa390_dat_test.c
+new file mode 100644
+index 000000000000..39bef3b2051a
+--- /dev/null
++++ b/tools/testing/selftests/kvm/s390/esa390_dat_test.c
+@@ -0,0 +1,1041 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Test ESA/390 DAT shadowing (KVM_CAP_S390_ESA390_CM, KVM_S390_ESA390_CM_DAT).
++ *
++ * The guest has ESA/390 segment and page tables in its storage. Small code
++ * fragments run with DAT off or on; the test checks LOAD REAL ADDRESS, the
++ * translation, translation and protection exceptions, the purges, the home
++ * space, prefixing on two CPUs, invalidation across CPUs, interruptions and
++ * the bound on the number of shadows.
++ */
++#include <errno.h>
++#include <pthread.h>
++#include <signal.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++
++#include "kvm_util.h"
++#include "test_util.h"
++#include "kselftest.h"
++#include "sie.h"
++
++#define GUEST_MEM_PAGES		512		/* 2 MiB */
++#define GUEST_CODE		0x2000UL
++#define PREFIX1			0x8000UL
++#define PREFIX2			0x15e000UL	/* in segment 1 */
++#define FLAG			0x6000UL	/* flag, progress counter */
++#define CSP_WORD		0x6100UL
++
++/* tables: segment table, page tables of segments 0 and 1 */
++#define STO			0x10000UL
++#define PTO0			0x11000UL
++#define PTO1			0x11400UL
++#define STD			(STO | 0)	/* 16 segments */
++#define STO_HOME		0x12000UL	/* home space: V_DATA -> R_DATA_B */
++#define PTO1_HOME		0x12400UL
++#define PTO1_ALT		0x13000UL	/* own page, unlike PTO0/PTO1 */
++#define STO2			0x14000UL	/* second space sharing PTO0/PTO1 */
++#define STD_PAIR		0x6200UL	/* STD, STO2 for LCTL */
++#define PTO0_ALT		0x15000UL	/* segment 0 with page 0 changing */
++#define STO3			0x16000UL
++#define STD_HOME		(STO_HOME | 0)
++#define STD_SSE			0x80000000U	/* space-switch-event control */
++#define STO_MANY		0x80000UL	/* copies for the bound test */
++#define NR_MANY			80
++
++/* virtual pages in segment 1 and what they map */
++#define V_CODE			0x100000UL	/* -> R_CODE */
++#define V_INVALID		0x101000UL	/* page invalid */
++#define V_PROT			0x102000UL	/* -> R_PROT, page protection */
++#define V_DATA			0x103000UL	/* -> R_DATA_A or R_DATA_B */
++#define V_NOMEM			0x104000UL	/* -> outside the configuration */
++#define R_CODE			0x150000UL
++#define R_PROT			0x152000UL
++#define R_DATA_A		0x153000UL
++#define R_DATA_B		0x154000UL
++#define R_NOMEM			0x7ff00000UL
++#define V_SEG2			0x200000UL	/* segment invalid */
++#define V_SEG16			0x1000000UL	/* beyond the segment-table length */
++
++#define ESA_STE_I		0x20U
++#define ESA_PTE_I		0x400U
++#define ESA_PTE_P		0x200U
++
++#define CR0_DAT			0x00b00000U	/* translation format */
++#define CR0_CKC			0x00000800U
++#define CR0_EMS			0x00004000U
++#define CR0_SAC			0x04000000U	/* secondary-space control */
++#define ESA_PSW_HOME		0x0000c000U
++#define LC_EXT_CPU_ADDR		132
++
++#define ESA_PSW_BIT12		0x00080000U
++#define ESA_PSW_DAT		0x04000000U
++#define ESA_PSW_EXT		0x01000000U
++#define PSW_MASK_DAT		0x0400000000000000ULL
++#define PSW_MASK_EXT		0x0100000000000000ULL
++#define PSW_MASK_BA		0x0000000080000000ULL
++
++/* ESA/390 assigned storage locations */
++#define ESA_EXT_OLD		24
++#define ESA_SVC_OLD		32
++#define ESA_PGM_OLD		40
++#define ESA_EXT_NEW		88
++#define ESA_SVC_NEW		96
++#define ESA_PGM_NEW		104
++#define LC_EXT_CODE		134
++#define LC_SVC_CODE		136
++#define LC_PGM_CODE		140
++#define LC_TEID			144
++
++enum { EXIT_SVC = 1, EXIT_EXT, EXIT_PGM = 5, EXIT_DONE = 8, EXIT_DONE2 = 9 };
++
++extern char g_start[], g_end[], g_load[], g_store[], g_lra[], g_ptlb[], g_ipte[],
++	g_csp[], g_stress[], g_stnsm[], g_stnsm_off[], g_svc[], g_loop[], g_lpsw[],
++	g_xread[], g_xread_new[], g_xipte[], g_xcsp[], g_sigp[], g_eloop[],
++	g_home[], g_home_sacf[], g_sac_sec[], g_xswitch[], g_xswitch_new[],
++	s_svc[], s_ext[], s_pgm[], g_code_v[], g_code_v_st[], g_code_v_end[];
++
++asm("	.pushsection .rodata, \"a\"\n"
++	"	.balign	8\n"
++	"g_start:\n"
++	"g_load:	l	%r1,0(%r2)\n	diag	8,0,0x501\n"
++	"g_store:	st	%r3,0(%r2)\n	diag	8,0,0x501\n"
++	"g_lra:	lra	%r1,0(%r2)\n	ipm	%r3\n	diag	8,0,0x501\n"
++	"g_ptlb:	ptlb\n	diag	8,0,0x501\n"
++	"g_ipte:	ipte	%r4,%r2\n	diag	8,0,0x501\n"
++	"g_csp:	csp	%r4,%r2\n	ipm	%r3\n	diag	8,0,0x501\n"
++	"g_stnsm:	stnsm	0(%r2),0xff\n	diag	8,0,0x501\n"
++	"g_stnsm_off:	stnsm	0(%r2),0xfb\n	diag	9,0,0x501\n"
++	"g_svc:	svc	0x42\n"
++	"g_loop:	j	g_loop\n"
++	"g_lpsw:	lpsw	0(%r2)\n"
++    /* r2 PTE, r3/r4 entries A/B, r5 count, r6 va, r9/r10 values, r11 PTO, r7 errors */
++	"g_stress:	st	%r3,0(%r2)\n"
++	"	ptlb\n"
++	"	l	%r1,0(%r6)\n"
++	"	cr	%r1,%r9\n"
++	"	je	1f\n"
++	"	ahi	%r7,1\n"
++	"1:	ipte	%r11,%r6\n"
++	"	st	%r4,0(%r2)\n"
++	"	l	%r1,0(%r6)\n"
++	"	cr	%r1,%r10\n"
++	"	je	2f\n"
++	"	ahi	%r7,1\n"
++	"2:	brct	%r5,g_stress\n"
++	"	diag	8,0,0x501\n"
++    /* r5 count, r6 va, r7 errors, r10 new value, r12 FLAG: read until the flag is set */
++	"g_xread:	st	%r5,8(%r12)\n"
++	"	l	%r8,0(%r12)\n"
++	"	l	%r1,0(%r6)\n"
++	"	ltr	%r8,%r8\n"
++	"	jz	1f\n"
++	"	ahi	%r7,1\n"
++	"	diag	8,0,0x501\n"
++	"1:	brct	%r5,g_xread\n"
++	"	diag	9,0,0x501\n"
++    /* the same, switching between two spaces (r13: their STDs) */
++	"g_xswitch:	st	%r5,8(%r12)\n"
++	"	lctl	%c1,%c1,0(%r13)\n"
++	"	l	%r8,0(%r12)\n"
++	"	l	%r1,0(%r6)\n"
++	"	ltr	%r8,%r8\n"
++	"	jz	1f\n"
++	"	ahi	%r7,1\n"
++	"	diag	8,0,0x501\n"
++	"1:	lctl	%c1,%c1,4(%r13)\n"
++	"	l	%r8,0(%r12)\n"
++	"	l	%r1,0(%r6)\n"
++	"	ltr	%r8,%r8\n"
++	"	jz	2f\n"
++	"	ahi	%r7,1\n"
++	"	diag	8,0,0x501\n"
++	"2:	brct	%r5,g_xswitch\n"
++	"	diag	9,0,0x501\n"
++	"g_xswitch_new:	st	%r5,8(%r12)\n"
++	"	lctl	%c1,%c1,0(%r13)\n"
++	"	l	%r8,0(%r12)\n"
++	"	l	%r1,0(%r6)\n"
++	"	ltr	%r8,%r8\n"
++	"	jz	1f\n"
++	"	cr	%r1,%r10\n"
++	"	je	3f\n"
++	"	ahi	%r7,1\n"
++	"3:	lctl	%c1,%c1,4(%r13)\n"
++	"	l	%r1,0(%r6)\n"
++	"	cr	%r1,%r10\n"
++	"	je	4f\n"
++	"	ahi	%r7,1\n"
++	"4:	diag	8,0,0x501\n"
++	"1:	lctl	%c1,%c1,4(%r13)\n"
++	"	l	%r1,0(%r6)\n"
++	"	brct	%r5,g_xswitch_new\n"
++	"	diag	9,0,0x501\n"
++	"g_xread_new:	st	%r5,8(%r12)\n"
++	"	l	%r8,0(%r12)\n"
++	"	l	%r1,0(%r6)\n"
++	"	ltr	%r8,%r8\n"
++	"	jz	1f\n"
++	"	cr	%r1,%r10\n"
++	"	je	2f\n"
++	"	ahi	%r7,1\n"
++	"2:	diag	8,0,0x501\n"
++	"1:	brct	%r5,g_xread_new\n"
++	"	diag	9,0,0x501\n"
++    /* r11 PTO, r6 va, r3 flag value, r12 FLAG */
++	"g_xipte:	ipte	%r11,%r6\n"
++	"	st	%r3,0(%r12)\n"
++	"	diag	8,0,0x501\n"
++    /* r2 PTE, r4 new entry, r13 CSP_WORD | 1, r0/r1 0 */
++	"g_xcsp:	st	%r4,0(%r2)\n"
++	"	csp	%r0,%r13\n"
++	"	st	%r3,0(%r12)\n"
++	"	diag	8,0,0x501\n"
++	"g_sigp:	sigp	%r6,%r2,3\n"
++	"	ipm	%r3\n"
++	"	diag	8,0,0x501\n"
++	"g_eloop:	st	%r5,8(%r12)\n"
++	"	j	g_eloop\n"
++    /* r2 va: load it in the home space, r4 from IAC there */
++	"g_home:	sac	0x300\n"
++	"	l	%r1,0(%r2)\n"
++	"	iac	%r4\n"
++	"	sac	0\n"
++	"	diag	8,0,0x501\n"
++	"g_home_sacf:	sacf	0x300\n"
++	"	l	%r1,0(%r2)\n"
++	"	sacf	0\n"
++	"	diag	8,0,0x501\n"
++	"g_sac_sec:	sac	0x100\n"
++	"	diag	8,0,0x501\n"
++	"s_svc:	diag	1,0,0x501\n"
++	"s_ext:	diag	2,0,0x501\n"
++	"s_pgm:	diag	5,0,0x501\n"
++    /* runs at V_CODE only: position independent */
++	"g_code_v:	basr	%r5,0\n"
++	"	l	%r1,0(%r2)\n	diag	8,0,0x501\n"
++	"g_code_v_st:	st	%r3,0(%r2)\n	diag	8,0,0x501\n"
++	"g_code_v_end:\n"
++	"g_end:\n"
++	"	.popsection\n");
++
++static struct kvm_vm *vm;
++static u8 *mem;
++
++static u64 gaddr(const char *label)
++{
++	return GUEST_CODE + (label - g_start);
++}
++
++static u32 rd32(unsigned long a)
++{
++	return be32toh(*(u32 *)(mem + a));
++}
++
++static u16 rd16(unsigned long a)
++{
++	return be16toh(*(u16 *)(mem + a));
++}
++
++static void wr32(unsigned long a, u32 v)
++{
++	*(u32 *)(mem + a) = htobe32(v);
++}
++
++static u64 rd64(unsigned long a)
++{
++	return be64toh(*(u64 *)(mem + a));
++}
++
++static void wr_esa_psw(unsigned long a, u32 mask, u64 ia)
++{
++	wr32(a, mask | ESA_PSW_BIT12);
++	wr32(a + 4, 0x80000000U | ia);
++}
++
++static void setup_lowcore(unsigned long lc)
++{
++	memset(mem + lc, 0, 0x1000);
++	wr_esa_psw(lc + ESA_SVC_NEW, 0, gaddr(s_svc));
++	wr_esa_psw(lc + ESA_EXT_NEW, 0, gaddr(s_ext));
++	wr_esa_psw(lc + ESA_PGM_NEW, 0, gaddr(s_pgm));
++}
++
++static void setup_tables(void)
++{
++	int i;
++
++	for (i = 0; i < 16; i++)
++		wr32(STO + 4 * i, ESA_STE_I);
++	wr32(STO, PTO0 | 0xf);
++	wr32(STO + 4, PTO1 | 0xf);
++	for (i = 0; i < 256; i++) {
++		wr32(PTO0 + 4 * i, i << 12);
++		wr32(PTO1 + 4 * i, ESA_PTE_I);
++	}
++	wr32(PTO1 + 0 * 4, R_CODE);
++	wr32(PTO1 + 2 * 4, R_PROT | ESA_PTE_P);
++	wr32(PTO1 + 3 * 4, R_DATA_A);
++	wr32(PTO1 + 4 * 4, R_NOMEM);
++	wr32(R_DATA_A, 0xaaaaaaaa);
++	wr32(R_DATA_B, 0xbbbbbbbb);
++	memcpy(mem + R_CODE, g_code_v, g_code_v_end - g_code_v);
++	for (i = 0; i < NR_MANY; i++)
++		memcpy(mem + STO_MANY + i * 0x1000, mem + STO, 64);
++	memcpy(mem + STO_HOME, mem + STO, 64);
++	memcpy(mem + STO2, mem + STO, 64);
++	wr32(STD_PAIR, STD);
++	wr32(STD_PAIR + 4, STO2 | 0);
++	memcpy(mem + PTO1_HOME, mem + PTO1, 1024);
++	wr32(STO_HOME + 4, PTO1_HOME | 0xf);
++	wr32(PTO1_HOME + 3 * 4, R_DATA_B);
++}
++
++static void set_cr(struct kvm_vcpu *vcpu, int n, u32 val)
++{
++	vcpu->run->s.regs.crs[n] = val;
++	vcpu->run->kvm_dirty_regs |= KVM_SYNC_CRS;
++}
++
++static void set_crs(struct kvm_vcpu *vcpu, u32 cr0, u32 cr1)
++{
++	vcpu->run->s.regs.crs[0] = cr0;
++	vcpu->run->s.regs.crs[1] = cr1;
++	vcpu->run->kvm_dirty_regs |= KVM_SYNC_CRS;
++}
++
++/* run @label with or without DAT and with r2..r4 set; return the exit */
++static int run(struct kvm_vcpu *vcpu, u64 ia, bool dat, u64 r2, u64 r3, u64 r4)
++{
++	struct kvm_run *r = vcpu->run;
++
++	r->psw_mask = PSW_MASK_BA | (dat ? PSW_MASK_DAT : 0);
++	r->psw_addr = ia;
++	r->s.regs.gprs[2] = r2;
++	r->s.regs.gprs[3] = r3;
++	r->s.regs.gprs[4] = r4;
++	r->kvm_dirty_regs |= KVM_SYNC_GPRS;
++	vcpu_run(vcpu);
++	TEST_ASSERT(r->exit_reason == KVM_EXIT_S390_SIEIC &&
++		    r->s390_sieic.icptcode == ICPT_INST &&
++		    (r->s390_sieic.ipa & 0xff0f) == 0x8300 &&
++		    r->s390_sieic.ipb == 0x05010000,
++		    "exit %u icpt 0x%02x ipa 0x%04x ipb 0x%08x psw 0x%016llx 0x%016llx",
++		    r->exit_reason, r->s390_sieic.icptcode, r->s390_sieic.ipa,
++		    r->s390_sieic.ipb, r->psw_mask, r->psw_addr);
++	return (r->s390_sieic.ipa >> 4) & 0xf;
++}
++
++static u32 gpr(struct kvm_vcpu *vcpu, int n)
++{
++	return vcpu->run->s.regs.gprs[n];
++}
++
++static void test_interface(void)
++{
++	struct kvm_vm *v = vm_create_barebones();
++	int rc;
++
++	vm_enable_cap(v, KVM_CAP_S390_USER_SIGP, 0);
++	rc = __vm_enable_cap(v, KVM_CAP_S390_ESA390_CM, 2);
++	TEST_ASSERT(rc == -1 && errno == EINVAL, "unknown flag accepted");
++	rc = __vm_enable_cap(v, KVM_CAP_S390_ESA390_CM, KVM_S390_ESA390_CM_DAT);
++	kvm_vm_free(v);
++	if (rc)
++		ksft_exit_skip("KVM_S390_ESA390_CM_DAT not supported\n");
++	ksft_test_result_pass("capability flag: unknown flags refused, DAT flag accepted\n");
++}
++
++/* LOAD REAL ADDRESS with DAT off and on, all condition codes */
++static void test_lra(struct kvm_vcpu *vcpu)
++{
++	static const struct { u64 va; u32 r1; int cc; } t[] = {
++		{ V_CODE + 0x123, R_CODE + 0x123, 0 },
++		{ 0x2345, 0x2345, 0 },
++		{ V_SEG2, STO + 8, 1 },
++		{ V_INVALID, PTO1 + 4, 2 },
++		{ V_SEG16, STO + 64, 3 },
++	};
++	int i, dat, n, bad = 0;
++
++	for (dat = 0; dat < 2; dat++) {
++		for (i = 0; i < ARRAY_SIZE(t); i++) {
++			n = run(vcpu, gaddr(g_lra), dat, t[i].va, 0, 0);
++			if (n != EXIT_DONE || gpr(vcpu, 1) != t[i].r1 ||
++			    ((gpr(vcpu, 3) >> 28) & 3) != t[i].cc) {
++				bad++;
++				ksft_print_msg("LRA %s va %llx: exit %d r1 %08x cc %u\n",
++					       dat ? "DAT on" : "DAT off",
++					       (unsigned long long)t[i].va,
++					       n, gpr(vcpu, 1), (gpr(vcpu, 3) >> 28) & 3);
++			}
++		}
++	}
++	ksft_test_result(!bad, "LRA with DAT off and on: cc 0-3 and R1 as the architecture says\n");
++}
++
++static void test_translation(struct kvm_vcpu *vcpu)
++{
++	int n;
++
++	/* translated load through a non-identity page, code at a non-identity address */
++	n = run(vcpu, V_CODE, true, V_DATA, 0, 0);
++	ksft_test_result(n == EXIT_DONE && gpr(vcpu, 1) == 0xaaaaaaaa &&
++			 (vcpu->run->psw_mask & PSW_MASK_DAT),
++			 "translated code and data on non-identity pages (exit %d, r1 %08x, psw %016llx)\n",
++			 n, gpr(vcpu, 1), vcpu->run->psw_mask);
++
++	/* page-translation exception: nullified, TEID = page */
++	n = run(vcpu, gaddr(g_load), true, V_INVALID + 0x234, 0, 0);
++	ksft_test_result(n == EXIT_PGM && rd16(LC_PGM_CODE + 2) == 0x11 &&
++			 rd16(LC_PGM_CODE) == 4 && rd32(LC_TEID) == V_INVALID &&
++			 rd32(ESA_PGM_OLD) == (ESA_PSW_BIT12 | ESA_PSW_DAT) &&
++			 rd32(ESA_PGM_OLD + 4) == (0x80000000U | gaddr(g_load)),
++			 "page-translation exception (code %x ilc %u teid %08x old psw %016lx)\n",
++			 rd16(LC_PGM_CODE + 2), rd16(LC_PGM_CODE), rd32(LC_TEID),
++			 rd64(ESA_PGM_OLD));
++
++	/* segment-translation exception */
++	n = run(vcpu, gaddr(g_load), true, V_SEG2, 0, 0);
++	ksft_test_result(n == EXIT_PGM && rd16(LC_PGM_CODE + 2) == 0x10 &&
++			 rd32(LC_TEID) == V_SEG2,
++			 "segment-translation exception (code %x teid %08x)\n",
++			 rd16(LC_PGM_CODE + 2), rd32(LC_TEID));
++
++	/* page protection: suppressed, TEID bit 29 */
++	wr32(R_PROT, 0x12345678);
++	n = run(vcpu, gaddr(g_store), true, V_PROT, 0x55555555, 0);
++	ksft_test_result(n == EXIT_PGM && rd16(LC_PGM_CODE + 2) == 0x04 &&
++			 rd32(LC_TEID) == (V_PROT | 4) && rd32(R_PROT) == 0x12345678 &&
++			 rd32(ESA_PGM_OLD + 4) == (0x80000000U | (gaddr(g_store) + 4)),
++			 "protection exception, operation suppressed (code %x teid %08x old psw %016lx)\n",
++			 rd16(LC_PGM_CODE + 2), rd32(LC_TEID), rd64(ESA_PGM_OLD));
++
++	/* a page frame outside the configuration */
++	n = run(vcpu, gaddr(g_load), true, V_NOMEM, 0, 0);
++	ksft_test_result(n == EXIT_PGM && rd16(LC_PGM_CODE + 2) == 0x05,
++			 "frame outside the configuration: addressing exception (code %x)\n",
++			 rd16(LC_PGM_CODE + 2));
++}
++
++/* the shadow follows the guest's purges, not its stores */
++static void test_purge(struct kvm_vcpu *vcpu)
++{
++	int n1, n2, n3;
++	u32 a, b;
++
++	wr32(PTO1 + 3 * 4, R_DATA_A);
++	n1 = run(vcpu, gaddr(g_load), true, V_DATA, 0, 0);
++	a = gpr(vcpu, 1);
++	/* change the valid entry and purge: the new mapping must be used */
++	wr32(PTO1 + 3 * 4, R_DATA_B);
++	n2 = run(vcpu, gaddr(g_ptlb), false, 0, 0, 0);
++	n3 = run(vcpu, gaddr(g_load), true, V_DATA, 0, 0);
++	b = gpr(vcpu, 1);
++	ksft_test_result(n1 == EXIT_DONE && n2 == EXIT_DONE && n3 == EXIT_DONE &&
++			 a == 0xaaaaaaaa && b == 0xbbbbbbbb,
++			 "PTLB after a table change (%08x then %08x)\n", a, b);
++
++	/* IPTE: invalid bit set in guest storage, translation gone */
++	n1 = run(vcpu, gaddr(g_ipte), false, V_DATA, 0, PTO1);
++	n2 = run(vcpu, gaddr(g_load), true, V_DATA, 0, 0);
++	ksft_test_result(n1 == EXIT_DONE && (rd32(PTO1 + 12) & ESA_PTE_I) &&
++			 n2 == EXIT_PGM && rd16(LC_PGM_CODE + 2) == 0x11,
++			 "IPTE invalidates the entry and the shadow (pte %08x, code %x)\n",
++			 rd32(PTO1 + 12), rd16(LC_PGM_CODE + 2));
++
++	/* CSP with the purge bit, from translated code */
++	wr32(PTO1 + 3 * 4, R_DATA_A);
++	wr32(0x3000, 7);
++	n1 = run(vcpu, gaddr(g_load), true, V_DATA, 0, 0);
++	wr32(PTO1 + 3 * 4, R_DATA_B);
++	n2 = run(vcpu, gaddr(g_csp), true, 0x3000 | 1, 0, 7);
++	n3 = run(vcpu, gaddr(g_load), true, V_DATA, 0, 0);
++	ksft_test_result(n1 == EXIT_DONE && n2 == EXIT_DONE &&
++			 !((gpr(vcpu, 3) >> 28) & 3) && n3 == EXIT_DONE &&
++			 gpr(vcpu, 1) == 0xbbbbbbbb,
++			 "CSP with purge from translated code (r1 %08x)\n", gpr(vcpu, 1));
++}
++
++/* the system-mask instructions see and change the guest's DAT bit */
++static void test_sysmask(struct kvm_vcpu *vcpu)
++{
++	int n;
++
++	mem[0x3100] = 0;
++	n = run(vcpu, gaddr(g_stnsm), true, 0x3100, 0, 0);
++	ksft_test_result(n == EXIT_DONE && mem[0x3100] == (ESA_PSW_DAT >> 24),
++			 "STNSM stores the DAT bit (%02x)\n", mem[0x3100]);
++	n = run(vcpu, gaddr(g_stnsm_off), true, 0x3100, 0, 0);
++	ksft_test_result(n == EXIT_DONE2 && !(vcpu->run->psw_mask & PSW_MASK_DAT),
++			 "STNSM turns DAT off (psw %016llx)\n", vcpu->run->psw_mask);
++}
++
++static void test_svc_lpsw(struct kvm_vcpu *vcpu)
++{
++	int n;
++
++	n = run(vcpu, gaddr(g_svc), true, 0, 0, 0);
++	ksft_test_result(n == EXIT_SVC && rd32(LC_SVC_CODE) == 0x20042 &&
++			 rd32(ESA_SVC_OLD) == (ESA_PSW_BIT12 | ESA_PSW_DAT) &&
++			 rd32(ESA_SVC_OLD + 4) == (0x80000000U | (gaddr(g_svc) + 2)),
++			 "SVC while translated: ESA/390 old PSW with DAT (%016lx, code %08x)\n",
++			 rd64(ESA_SVC_OLD), rd32(LC_SVC_CODE));
++
++	/* LPSW with DAT off loads a DAT-on PSW */
++	wr_esa_psw(0x3200, ESA_PSW_DAT, V_CODE);
++	n = run(vcpu, gaddr(g_lpsw), false, 0x3200, 0, 0);
++	wr32(PTO1 + 3 * 4, R_DATA_A);
++	ksft_test_result(n == EXIT_DONE && (vcpu->run->psw_mask & PSW_MASK_DAT),
++			 "LPSW from DAT off into translated code (psw %016llx)\n",
++			 vcpu->run->psw_mask);
++}
++
++/* a clock-comparator interruption reaches a translated loop */
++static void test_ckc(struct kvm_vcpu *vcpu)
++{
++	struct kvm_run *r = vcpu->run;
++	u64 tod, ckc;
++
++	alarm(20);
++	kvm_device_attr_get(vm->fd, KVM_S390_VM_TOD, KVM_S390_VM_TOD_LOW, &tod);
++	ckc = tod + (100000ULL << 12);		/* 100 ms */
++	vcpu_set_reg(vcpu, KVM_REG_S390_CLOCK_COMP, ckc);
++	set_crs(vcpu, CR0_DAT | CR0_CKC, STD);
++	r->psw_mask = PSW_MASK_BA | PSW_MASK_DAT | PSW_MASK_EXT;
++	r->psw_addr = gaddr(g_loop);
++	vcpu_run(vcpu);
++	alarm(0);
++	ksft_test_result(r->exit_reason == KVM_EXIT_S390_SIEIC &&
++			 ((r->s390_sieic.ipa >> 4) & 0xf) == EXIT_EXT &&
++			 rd16(LC_EXT_CODE) == 0x1004 &&
++			 rd32(ESA_EXT_OLD) == (ESA_PSW_BIT12 | ESA_PSW_DAT | ESA_PSW_EXT),
++			 "clock comparator interrupts a translated loop (code %04x, old psw %016lx)\n",
++			 rd16(LC_EXT_CODE), rd64(ESA_EXT_OLD));
++	vcpu_set_reg(vcpu, KVM_REG_S390_CLOCK_COMP, -1ULL);
++	set_crs(vcpu, CR0_DAT, STD);
++}
++
++/*
++ * An odd instruction address is recognized only when an instruction is
++ * fetched: LPSW of a wait PSW with one is valid, the interruption ending
++ * the wait stores it.
++ */
++static void test_odd_wait(struct kvm_vcpu *vcpu)
++{
++	u64 tod, ckc;
++	int n;
++
++	wr_esa_psw(0x3200, ESA_PSW_DAT | ESA_PSW_EXT | 0x00020000U, 0x4001);
++	alarm(20);
++	kvm_device_attr_get(vm->fd, KVM_S390_VM_TOD, KVM_S390_VM_TOD_LOW, &tod);
++	ckc = tod + (50000ULL << 12);		/* 50 ms */
++	vcpu_set_reg(vcpu, KVM_REG_S390_CLOCK_COMP, ckc);
++	set_crs(vcpu, CR0_DAT | CR0_CKC, STD);
++	n = run(vcpu, gaddr(g_lpsw), true, 0x3200, 0, 0);
++	alarm(0);
++	ksft_test_result(n == EXIT_EXT && rd16(LC_EXT_CODE) == 0x1004 &&
++			 rd32(ESA_EXT_OLD + 4) == 0x80004001U,
++			 "LPSW of a wait PSW with an odd address while translated (exit %d, old psw %016lx)\n",
++			 n, rd64(ESA_EXT_OLD));
++	vcpu_set_reg(vcpu, KVM_REG_S390_CLOCK_COMP, -1ULL);
++	set_crs(vcpu, CR0_DAT, STD);
++}
++
++/* two CPUs with different prefixes read their own low storage at virtual 0 */
++struct prefix_arg {
++	struct kvm_vcpu *vcpu;
++	u32 expect;
++	int bad;
++};
++
++static void *prefix_thread(void *data)
++{
++	struct prefix_arg *a = data;
++	int i;
++
++	for (i = 0; i < 2000; i++) {
++		if (run(a->vcpu, gaddr(g_load), true, 0x200, 0, 0) != EXIT_DONE ||
++		    gpr(a->vcpu, 1) != a->expect)
++			a->bad++;
++	}
++	return NULL;
++}
++
++static void test_two_cpus(struct kvm_vcpu *vcpu0, struct kvm_vcpu *vcpu1)
++{
++	struct prefix_arg a0 = { vcpu0, 0x11111111 }, a1 = { vcpu1, 0x22222222 };
++	pthread_t t0, t1;
++
++	wr32(0x200, 0x11111111);
++	wr32(PREFIX1 + 0x200, 0x22222222);
++	pthread_create(&t0, NULL, prefix_thread, &a0);
++	pthread_create(&t1, NULL, prefix_thread, &a1);
++	pthread_join(t0, NULL);
++	pthread_join(t1, NULL);
++	ksft_test_result(!a0.bad && !a1.bad,
++			 "two vCPUs translated at the same time, each sees its prefix area (%d %d)\n",
++			 a0.bad, a1.bad);
++}
++
++/*
++ * vCPU 0 reads a virtual page in a loop; vCPU 1 changes its translation and
++ * then sets a flag. Once vCPU 0 sees the flag, it must see the change: an
++ * invalidation or purge on one CPU completes for all CPUs.
++ */
++struct reader_arg {
++	struct kvm_vcpu *vcpu;
++	const char *code;
++	int exit;
++};
++
++static void *reader_thread(void *data)
++{
++	struct reader_arg *a = data;
++	__u64 *g = a->vcpu->run->s.regs.gprs;
++
++	g[5] = 0x7fffffff;
++	g[6] = V_DATA;
++	g[7] = 0;
++	g[10] = 0xbbbbbbbb;
++	g[12] = FLAG;
++	g[13] = STD_PAIR;
++	a->exit = run(a->vcpu, gaddr(a->code), true, 0, 0, 0);
++	return NULL;
++}
++
++static void wait_reader(void)
++{
++	while (!rd32(FLAG + 8))
++		usleep(10);
++	usleep(200);
++}
++
++static void test_cross_ipte(struct kvm_vcpu *vcpu0, struct kvm_vcpu *vcpu1, bool sw)
++{
++	struct reader_arg a = { vcpu0, sw ? g_xswitch : g_xread };
++	int i, bad = 0;
++	pthread_t t;
++
++	for (i = 0; i < 200 && !bad; i++) {
++		wr32(PTO1 + 12, R_DATA_A);
++		wr32(FLAG, 0);
++		wr32(FLAG + 8, 0);
++		pthread_create(&t, NULL, reader_thread, &a);
++		wait_reader();
++		vcpu1->run->s.regs.gprs[6] = V_DATA;
++		vcpu1->run->s.regs.gprs[11] = PTO1;
++		vcpu1->run->s.regs.gprs[12] = FLAG;
++		if (run(vcpu1, gaddr(g_xipte), true, 0, 1, 0) != EXIT_DONE)
++			bad++;
++		pthread_join(t, NULL);
++		if (a.exit != EXIT_PGM || rd16(LC_PGM_CODE + 2) != 0x11 || gpr(vcpu0, 7))
++			bad++;
++	}
++	ksft_test_result(!bad,
++			 "IPTE on one vCPU invalidates the page for a vCPU reading it%s (%d rounds, exit %d code %x)\n",
++			 sw ? " in two spaces sharing the page table" : "",
++			 i, a.exit, rd16(LC_PGM_CODE + 2));
++	wr32(PTO1 + 12, R_DATA_A);
++	set_crs(vcpu0, CR0_DAT, STD);
++}
++
++static void test_cross_csp(struct kvm_vcpu *vcpu0, struct kvm_vcpu *vcpu1, bool sw)
++{
++	struct reader_arg a = { vcpu0, sw ? g_xswitch_new : g_xread_new };
++	__u64 *g = vcpu1->run->s.regs.gprs;
++	int i, bad = 0;
++	pthread_t t;
++
++	for (i = 0; i < 200 && !bad; i++) {
++		wr32(PTO1 + 12, R_DATA_A);
++		TEST_ASSERT_EQ(run(vcpu0, gaddr(g_ptlb), false, 0, 0, 0), EXIT_DONE);
++		TEST_ASSERT_EQ(run(vcpu1, gaddr(g_ptlb), false, 0, 0, 0), EXIT_DONE);
++		wr32(FLAG, 0);
++		wr32(FLAG + 8, 0);
++		wr32(CSP_WORD, 0);
++		pthread_create(&t, NULL, reader_thread, &a);
++		wait_reader();
++		g[0] = 0;
++		g[1] = 0;
++		g[12] = FLAG;
++		g[13] = CSP_WORD | 1;
++		if (run(vcpu1, gaddr(g_xcsp), true, PTO1 + 12, 1, R_DATA_B) != EXIT_DONE)
++			bad++;
++		pthread_join(t, NULL);
++		if (a.exit != EXIT_DONE || gpr(vcpu0, 7) || gpr(vcpu0, 1) != 0xbbbbbbbb)
++			bad++;
++	}
++	ksft_test_result(!bad,
++			 "CSP with purge on one vCPU purges for a vCPU reading the page%s (%d rounds, exit %d value %08x)\n",
++			 sw ? " in two spaces sharing the page table" : "",
++			 i, a.exit, gpr(vcpu0, 1));
++	set_crs(vcpu0, CR0_DAT, STD);
++	wr32(PTO1 + 12, R_DATA_A);
++	TEST_ASSERT_EQ(run(vcpu0, gaddr(g_ptlb), false, 0, 0, 0), EXIT_DONE);
++	TEST_ASSERT_EQ(run(vcpu1, gaddr(g_ptlb), false, 0, 0, 0), EXIT_DONE);
++}
++
++/*
++ * Prefixing swaps virtual page PREFIX2 into shadow segment 0, which has its
++ * page table from segment 0 already: IPTE of its entry must still reach it.
++ * Segment 1 uses a page table in a page of its own here, so that nothing
++ * else ties that page to the shadow.
++ */
++static void test_prefix_ipte(struct kvm_vcpu *vcpu0, struct kvm_vcpu *vcpu1)
++{
++	u32 pte = PTO1_ALT + 4 * ((PREFIX2 >> 12) & 0xff);
++	u16 code;
++	int n;
++
++	memcpy(mem + PTO1_ALT, mem + PTO1, 1024);
++	wr32(STO + 4, PTO1_ALT | 0xf);
++	setup_lowcore(PREFIX2);
++	wr32(pte, PREFIX2);
++	vcpu1->run->s.regs.prefix = PREFIX2;
++	vcpu1->run->kvm_dirty_regs |= KVM_SYNC_PREFIX;
++	wr32(0x200, 0x5a5a5a5a);
++	TEST_ASSERT_EQ(run(vcpu1, gaddr(g_load), true, 0x1200, 0, 0), EXIT_DONE);
++	n = run(vcpu1, gaddr(g_load), true, PREFIX2 + 0x200, 0, 0);
++	TEST_ASSERT(n == EXIT_DONE && gpr(vcpu1, 1) == 0x5a5a5a5a,
++		    "virtual prefix page reads absolute page 0 (%d %08x)", n, gpr(vcpu1, 1));
++	vcpu0->run->s.regs.gprs[6] = PREFIX2;
++	vcpu0->run->s.regs.gprs[11] = PTO1_ALT;
++	vcpu0->run->s.regs.gprs[12] = FLAG + 0x10;
++	TEST_ASSERT_EQ(run(vcpu0, gaddr(g_xipte), true, 0, 1, 0), EXIT_DONE);
++	n = run(vcpu1, gaddr(g_load), true, PREFIX2 + 0x200, 0, 0);
++	code = rd16(PREFIX2 + LC_PGM_CODE + 2);
++	ksft_test_result(n == EXIT_PGM && code == 0x11,
++			 "IPTE reaches the page that prefixing moved to another shadow segment (exit %d code %x)\n",
++			 n, code);
++	wr32(STO + 4, PTO1 | 0xf);
++	TEST_ASSERT_EQ(run(vcpu0, gaddr(g_ptlb), false, 0, 0, 0), EXIT_DONE);
++	vcpu1->run->s.regs.prefix = PREFIX1;
++	vcpu1->run->kvm_dirty_regs |= KVM_SYNC_PREFIX;
++	TEST_ASSERT_EQ(run(vcpu1, gaddr(g_ptlb), false, 0, 0, 0), EXIT_DONE);
++	memset(mem + PREFIX2, 0, 0x1000);
++}
++
++/* SIGP EMERGENCY SIGNAL from one vCPU interrupts a translated loop on another */
++static void *eloop_thread(void *data)
++{
++	struct kvm_vcpu *vcpu = data;
++	struct kvm_run *r = vcpu->run;
++
++	set_crs(vcpu, CR0_DAT | CR0_EMS, STD);
++	r->psw_mask = PSW_MASK_BA | PSW_MASK_DAT | PSW_MASK_EXT;
++	r->psw_addr = gaddr(g_eloop);
++	r->s.regs.gprs[12] = FLAG;
++	r->s.regs.gprs[5] = 1;
++	r->kvm_dirty_regs |= KVM_SYNC_GPRS;
++	vcpu_run(vcpu);
++	return NULL;
++}
++
++static void test_sigp_emergency(struct kvm_vcpu *vcpu0, struct kvm_vcpu *vcpu1)
++{
++	struct kvm_run *r = vcpu0->run;
++	pthread_t t;
++	int n;
++
++	wr32(FLAG + 8, 0);
++	alarm(20);
++	pthread_create(&t, NULL, eloop_thread, vcpu0);
++	wait_reader();
++	n = run(vcpu1, gaddr(g_sigp), true, 0, 0, 0);
++	pthread_join(t, NULL);
++	alarm(0);
++	ksft_test_result(n == EXIT_DONE && ((gpr(vcpu1, 3) >> 28) & 3) == 0 &&
++			 r->exit_reason == KVM_EXIT_S390_SIEIC &&
++			 ((r->s390_sieic.ipa >> 4) & 0xf) == EXIT_EXT &&
++			 rd16(LC_EXT_CODE) == 0x1201 && rd16(LC_EXT_CPU_ADDR) == 1 &&
++			 (rd32(ESA_EXT_OLD) & ESA_PSW_DAT),
++			 "SIGP emergency signal interrupts a translated vCPU (code %04x from %u, old psw %016lx)\n",
++			 rd16(LC_EXT_CODE), rd16(LC_EXT_CPU_ADDR), rd64(ESA_EXT_OLD));
++	set_crs(vcpu0, CR0_DAT, STD);
++}
++
++/* SAC and SACF to the home space translate with control register 13 */
++static void test_home_space(struct kvm_vcpu *vcpu)
++{
++	u32 r1, r4;
++	int n, m;
++
++	set_cr(vcpu, 0, CR0_DAT | CR0_SAC);
++	set_cr(vcpu, 13, STD_HOME);
++	n = run(vcpu, gaddr(g_home), true, V_DATA, 0, 0);
++	r1 = gpr(vcpu, 1);
++	r4 = gpr(vcpu, 4);
++	m = run(vcpu, gaddr(g_home_sacf), true, V_DATA, 0, 0);
++	ksft_test_result(n == EXIT_DONE && r1 == 0xbbbbbbbb && (r4 & 0xff00) == 0x300 &&
++			 m == EXIT_DONE && gpr(vcpu, 1) == 0xbbbbbbbb &&
++			 !(vcpu->run->psw_mask & 0x0000c00000000000ULL),
++			 "home space by SAC and SACF, IAC reports it (r1 %08x iac %04x, sacf r1 %08x)\n",
++			 r1, r4 & 0xff00, gpr(vcpu, 1));
++}
++
++/* a switch to the home space with a space-switch-event control */
++static void test_space_switch(struct kvm_vcpu *vcpu)
++{
++	u32 old_mask, old_addr;
++	u16 code;
++	int n;
++
++	set_cr(vcpu, 1, STD | STD_SSE);
++	n = run(vcpu, gaddr(g_home), true, V_DATA, 0, 0);
++	code = rd16(LC_PGM_CODE + 2);
++	old_mask = rd32(ESA_PGM_OLD);
++	old_addr = rd32(ESA_PGM_OLD + 4) & 0x7fffffff;
++	ksft_test_result(n == EXIT_PGM && code == 0x1c &&
++			 (old_mask & ESA_PSW_HOME) == ESA_PSW_HOME &&
++			 old_addr == gaddr(g_home) + 4 && (rd32(LC_TEID) & 0x80000000),
++			 "space-switch event after SAC to the home space (code %x old psw %08x %08x teid %08x)\n",
++			 code, old_mask, old_addr, rd32(LC_TEID));
++	set_cr(vcpu, 1, STD);
++}
++
++/* the secondary space is not provided: KVM_RUN fails, nothing hangs */
++static void test_secondary_refused(struct kvm_vcpu *vcpu)
++{
++	struct kvm_run *r = vcpu->run;
++	int rc;
++
++	r->psw_mask = PSW_MASK_BA | PSW_MASK_DAT;
++	r->psw_addr = gaddr(g_sac_sec);
++	rc = __vcpu_run(vcpu);
++	ksft_test_result(rc < 0 && errno == EOPNOTSUPP,
++			 "SAC to the secondary space while translated: KVM_RUN fails with EOPNOTSUPP (%d %d)\n",
++			 rc, errno);
++	set_cr(vcpu, 0, CR0_DAT);
++	TEST_ASSERT_EQ(run(vcpu, gaddr(g_ptlb), false, 0, 0, 0), EXIT_DONE);
++}
++
++/*
++ * A space whose virtual page 0 is not translated, then another space, then
++ * the first one again after its page 0 became valid (no purge needed for
++ * that): it reads the guest's page, not the page that stood in for it.
++ */
++static void test_page0_back(struct kvm_vcpu *vcpu)
++{
++	u64 v = 0x80;
++	int n;
++
++	memcpy(mem + PTO0_ALT, mem + PTO0, 1024);
++	wr32(PTO0_ALT, ESA_PTE_I);
++	memcpy(mem + STO3, mem + STO, 64);
++	wr32(STO3, PTO0_ALT | 0xf);
++	wr32(R_DATA_B + v, 0x5c5c5c5c);
++
++	set_crs(vcpu, CR0_DAT, STO3);
++	TEST_ASSERT_EQ(run(vcpu, gaddr(g_load), true, 0x1200, 0, 0), EXIT_DONE);
++	set_crs(vcpu, CR0_DAT, STD);
++	TEST_ASSERT_EQ(run(vcpu, gaddr(g_load), true, 0x1200, 0, 0), EXIT_DONE);
++	wr32(PTO0_ALT, R_DATA_B);
++	set_crs(vcpu, CR0_DAT, STO3);
++	n = run(vcpu, gaddr(g_load), true, v, 0, 0);
++	ksft_test_result(n == EXIT_DONE && gpr(vcpu, 1) == 0x5c5c5c5c,
++			 "virtual page 0 made valid while its space was not in use is used when it is again (%d %08x)\n",
++			 n, gpr(vcpu, 1));
++	set_crs(vcpu, CR0_DAT, STD);
++	TEST_ASSERT_EQ(run(vcpu, gaddr(g_ptlb), false, 0, 0, 0), EXIT_DONE);
++	wr32(R_DATA_B + v, 0);
++}
++
++/* more segment tables than shadows are kept: still correct, older ones recreated */
++static void test_bound(struct kvm_vcpu *vcpu)
++{
++	u64 created0, created1, created2;
++	int i, bad = 0;
++
++	created0 = vm_get_stat(vm, gmap_shadow_create);
++	for (i = 0; i < NR_MANY; i++) {
++		set_crs(vcpu, CR0_DAT, STO_MANY + i * 0x1000);
++		if (run(vcpu, gaddr(g_load), true, V_DATA, 0, 0) != EXIT_DONE ||
++		    gpr(vcpu, 1) != 0xaaaaaaaa)
++			bad++;
++	}
++	created1 = vm_get_stat(vm, gmap_shadow_create);
++	/* the first ones were dropped: recreated */
++	set_crs(vcpu, CR0_DAT, STO_MANY);
++	run(vcpu, gaddr(g_load), true, V_DATA, 0, 0);
++	created2 = vm_get_stat(vm, gmap_shadow_create);
++	set_crs(vcpu, CR0_DAT, STD);
++	ksft_test_result(!bad && created1 - created0 == NR_MANY && created2 == created1 + 1,
++			 "%d segment tables: translation right, least recently used shadows dropped (%llu %llu)\n",
++			 NR_MANY, (unsigned long long)(created1 - created0),
++			 (unsigned long long)(created2 - created1));
++}
++
++/*
++ * Virtual page 0 not translated: SIE still needs a prefix page, KVM's stands
++ * in for it. Once the guest makes the segment valid (no purge needed for
++ * invalid -> valid), virtual 0 is the guest's page again.
++ */
++static void test_page0_invalid(struct kvm_vcpu *vcpu)
++{
++	int n1, n2;
++	u32 a, b;
++
++	wr32(0x200, 0x11111111);
++	wr32(STO, ESA_STE_I);
++	n1 = run(vcpu, V_CODE, true, V_DATA, 0, 0);
++	a = gpr(vcpu, 1);
++	wr32(STO, PTO0 | 0xf);
++	n2 = run(vcpu, V_CODE, true, 0x200, 0, 0);
++	b = gpr(vcpu, 1);
++	ksft_test_result(n1 == EXIT_DONE && a == 0xaaaaaaaa && n2 == EXIT_DONE && b == 0x11111111,
++			 "translated code runs while virtual page 0 is invalid; valid again without purge (%d %08x %d %08x)\n",
++			 n1, a, n2, b);
++}
++
++/* after a switch to z/Architecture, the purges are the machine's again */
++static void test_zarch_after(struct kvm_vcpu *vcpu)
++{
++	u32 mode = KVM_S390_ARCH_MODE_ZARCH;
++	u64 ins0;
++	int n;
++
++	n = run(vcpu, gaddr(g_load), true, V_DATA, 0, 0);
++	TEST_ASSERT_EQ(n, EXIT_DONE);
++	kvm_device_attr_set(vm->fd, KVM_S390_VM_ARCH_MODE, KVM_S390_VM_ARCH_MODE_CURRENT, &mode);
++	ins0 = vcpu_get_stat(vcpu, exit_instruction);
++	n = run(vcpu, gaddr(g_ptlb), false, 0, 0, 0);
++	ksft_test_result(n == EXIT_DONE && vcpu_get_stat(vcpu, exit_instruction) == ins0 + 1,
++			 "z/Architecture after DAT shadowing: PTLB runs without interception (%llu exits)\n",
++			 (unsigned long long)(vcpu_get_stat(vcpu, exit_instruction) - ins0));
++}
++
++/*
++ * The guest changes a valid entry and purges, many times: with PTLB, and
++ * with IPTE followed by a new valid entry (invalid -> valid, no purge).
++ */
++static void test_stress(struct kvm_vcpu *vcpu)
++{
++	__u64 *g = vcpu->run->s.regs.gprs;
++	int n;
++
++	g[5] = 20000;
++	g[6] = V_DATA;
++	g[7] = 0;
++	g[9] = 0xaaaaaaaa;
++	g[10] = 0xbbbbbbbb;
++	g[11] = PTO1;
++	n = run(vcpu, gaddr(g_stress), true, PTO1 + 12, R_DATA_A, R_DATA_B);
++	ksft_test_result(n == EXIT_DONE && !gpr(vcpu, 7),
++			 "40000 table changes by translated code, each seen after its purge (%u wrong)\n",
++			 gpr(vcpu, 7));
++	wr32(PTO1 + 12, R_DATA_A);
++}
++
++/*
++ * While virtual page 0 is not translated, a page of KVM stands in for it as
++ * SIE's prefix page. A store to its first 512 bytes still gets the
++ * translation exception.
++ */
++static void test_page0_store(struct kvm_vcpu *vcpu)
++{
++	u64 va_st = V_CODE + (g_code_v_st - g_code_v);
++	int n;
++
++	wr32(STO, ESA_STE_I);
++	wr32(0x80, 0x12345678);
++	TEST_ASSERT_EQ(run(vcpu, gaddr(g_ptlb), false, 0, 0, 0), EXIT_DONE);
++	n = run(vcpu, va_st, true, 0x80, 0x55555555, 0);
++	ksft_test_result(n == EXIT_PGM && rd16(LC_PGM_CODE + 2) == 0x10 &&
++			 rd32(LC_TEID) == 0 && rd32(0x80) == 0x12345678 &&
++			 rd32(ESA_PGM_OLD + 4) == (0x80000000U | va_st),
++			 "store to untranslated virtual page 0: segment-translation exception (code %x teid %08x old psw %016lx)\n",
++			 rd16(LC_PGM_CODE + 2), rd32(LC_TEID), rd64(ESA_PGM_OLD));
++
++	wr32(STO, PTO0 | 0xf);
++}
++
++/* nothing of the shadow appears in guest storage */
++static void test_no_guest_storage(u32 sum_before, u32 sum_after)
++{
++	ksft_test_result(sum_before == sum_after,
++			 "guest storage outside what the guest wrote is unchanged (%08x %08x)\n",
++			 sum_before, sum_after);
++}
++
++static u32 checksum_unused(void)
++{
++	u32 sum = 0;
++	unsigned long a;
++
++	/* 0x160000.. is never written by the guest or the test */
++	for (a = 0x160000; a < GUEST_MEM_PAGES * 0x1000UL; a += 4)
++		sum = sum * 31 + rd32(a);
++	return sum;
++}
++
++int main(int argc, char *argv[])
++{
++	struct kvm_vcpu *vcpu0, *vcpu1;
++	u32 mode = KVM_S390_ARCH_MODE_ESA390_CM;
++	u32 sum;
++	unsigned long a;
++
++	TEST_REQUIRE(kvm_has_cap(KVM_CAP_S390_ESA390_CM));
++	ksft_print_header();
++	ksft_set_plan(33);
++
++	test_interface();
++
++	vm = vm_create_barebones();
++	vm_enable_cap(vm, KVM_CAP_S390_USER_SIGP, 0);
++	vm_enable_cap(vm, KVM_CAP_S390_ESA390_CM, KVM_S390_ESA390_CM_DAT);
++	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS, 0, 0, GUEST_MEM_PAGES, 0);
++	mem = addr_gpa2hva(vm, 0);
++	for (a = 0x160000; a < GUEST_MEM_PAGES * 0x1000UL; a += 4)
++		wr32(a, a * 2654435761U);
++	sum = checksum_unused();
++	memcpy(mem + GUEST_CODE, g_start, g_end - g_start);
++	setup_tables();
++	setup_lowcore(0);
++	setup_lowcore(PREFIX1);
++	kvm_device_attr_set(vm->fd, KVM_S390_VM_ARCH_MODE, KVM_S390_VM_ARCH_MODE_CURRENT, &mode);
++
++	vcpu0 = __vm_vcpu_add(vm, 0);
++	vcpu1 = __vm_vcpu_add(vm, 1);
++	vcpu1->run->s.regs.prefix = PREFIX1;
++	vcpu1->run->kvm_dirty_regs |= KVM_SYNC_PREFIX;
++	set_crs(vcpu0, CR0_DAT, STD);
++	set_crs(vcpu1, CR0_DAT, STD);
++
++	vcpu0->run->psw_mask = PSW_MASK_BA;
++	vcpu0->run->psw_addr = gaddr(g_ptlb);
++	if (__vcpu_run(vcpu0) < 0 && errno == EINVAL)
++		ksft_exit_skip("the host does not run ESA/390-format state descriptions\n");
++
++	test_lra(vcpu0);
++	test_translation(vcpu0);
++	test_purge(vcpu0);
++	test_sysmask(vcpu0);
++	test_svc_lpsw(vcpu0);
++	test_ckc(vcpu0);
++	test_odd_wait(vcpu0);
++	test_home_space(vcpu0);
++	test_space_switch(vcpu0);
++	test_secondary_refused(vcpu0);
++	test_two_cpus(vcpu0, vcpu1);
++	test_cross_ipte(vcpu0, vcpu1, false);
++	test_cross_csp(vcpu0, vcpu1, false);
++	test_cross_ipte(vcpu0, vcpu1, true);
++	test_cross_csp(vcpu0, vcpu1, true);
++	test_prefix_ipte(vcpu0, vcpu1);
++	test_sigp_emergency(vcpu0, vcpu1);
++	test_bound(vcpu0);
++	test_page0_invalid(vcpu0);
++	test_page0_back(vcpu0);
++	test_page0_store(vcpu0);
++	test_stress(vcpu0);
++	test_no_guest_storage(sum, checksum_unused());
++	test_zarch_after(vcpu0);
++
++	kvm_vm_free(vm);
++	ksft_finished();
++}
+-- 
+2.47.3
+
