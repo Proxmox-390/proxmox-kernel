@@ -1,4 +1,4 @@
-From 0b930c2cc28a3db03009bbbfa69f470b563b781d Mon Sep 17 00:00:00 2001
+From a5493d83901a6ce6d86ecf4c6a1a9eff12b49adc Mon Sep 17 00:00:00 2001
 From: Yvan Janssens <yvanj@cyber.gent>
 Date: Thu, 26 Nov 2026 11:05:16 +0100
 Subject: [RFC PATCH 2/4] KVM: s390: Run ESA/390 DAT-on code on shadow address
@@ -45,13 +45,13 @@ Nothing enables this yet.
  arch/s390/kvm/gmap/gmap.c                   |  14 +-
  arch/s390/kvm/gmap/gmap.h                   |   1 +
  arch/s390/kvm/s390/Makefile                 |   2 +-
- arch/s390/kvm/s390/esa390-dat.c             | 906 ++++++++++++++++++++
+ arch/s390/kvm/s390/esa390-dat.c             | 911 ++++++++++++++++++++
  arch/s390/kvm/s390/intercept.c              |  29 +
  arch/s390/kvm/s390/interrupt.c              |  18 +
  arch/s390/kvm/s390/priv.c                   |  26 +-
  arch/s390/kvm/s390/s390.c                   |  37 +-
  arch/s390/kvm/s390/s390.h                   |  21 +
- 11 files changed, 1053 insertions(+), 11 deletions(-)
+ 11 files changed, 1058 insertions(+), 11 deletions(-)
  create mode 100644 arch/s390/kvm/s390/esa390-dat.c
 
 diff --git a/arch/s390/include/asm/kvm_host_s390.h b/arch/s390/include/asm/kvm_host_s390.h
@@ -172,10 +172,10 @@ index 762a63826423..4a9d7ab26114 100644
  kvm-$(CONFIG_VFIO_PCI_ZDEV_KVM) += pci.o
 diff --git a/arch/s390/kvm/s390/esa390-dat.c b/arch/s390/kvm/s390/esa390-dat.c
 new file mode 100644
-index 000000000000..68b21e3590c9
+index 000000000000..f9eea6c46cd6
 --- /dev/null
 +++ b/arch/s390/kvm/s390/esa390-dat.c
-@@ -0,0 +1,906 @@
+@@ -0,0 +1,911 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * ESA/390 DAT shadowing for the ESA/390-compatibility mode
@@ -323,6 +323,11 @@ index 000000000000..68b21e3590c9
 +		esa390_evict(vcpu->kvm, parent);
 +	}
 +	esa390_put_shadow(esa);
++	/*
++	 * Another shadow, possibly one in the tables of a dropped one and with
++	 * its ASCE: the machine must not use what it still holds for that ASCE.
++	 */
++	vcpu->arch.sie_block->ihcpu = 0xffff;
 +
 +	for (;;) {
 +		sg = gmap_create_esa390_shadow(vcpu->arch.mc, parent, std, prefix);

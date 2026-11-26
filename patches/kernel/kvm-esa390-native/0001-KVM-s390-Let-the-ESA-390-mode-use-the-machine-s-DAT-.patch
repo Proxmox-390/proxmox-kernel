@@ -1,0 +1,144 @@
+From e6e4548c061656d20ccc817a87a97c1a311836d5 Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
+Date: Thu, 26 Nov 2026 20:36:19 +0100
+Subject: [PATCH] KVM: s390: Let the ESA/390 mode use the machine's DAT without
+ CZAM
+
+On a machine without the configuration-z/Architecture-architectural-mode
+facility (bit 138 not in the host's facility list: z196, z114, zEC12,
+zBC12 and older), SIE runs a state description without the z/Architecture
+flag in ESA/390 mode proper, dynamic address translation included. KVM's
+own PSW checks in the mode still refuse a PSW with the DAT bit unless
+ESA/390 DAT shadowing is enabled: an intercepted LOAD PSW of a DAT-on PSW
+gets a specification exception, and an intercepted specification
+exception whose program new PSW has the DAT bit ends KVM_RUN with
+-EOPNOTSUPP.
+
+Remember at KVM_CAP_S390_ESA390_CM whether the host is such a machine.
+There a PSW with the DAT bit is valid in the mode; the guest accesses of
+intercepted instructions are already translated with the ESA/390 walker
+of the DAT shadowing patch, in the space the address-space control
+selects (access-register mode stays unsupported). KVM_S390_ESA390_CM_DAT
+is refused there: the machine translates, there is nothing to shadow.
+
+Not tested on such a machine (none available); build-tested only (W=1,
+sparse). On machines with facility 138 nothing changes.
+---
+ Documentation/virt/kvm/api.rst        |  9 ++++++++-
+ arch/s390/include/asm/kvm_host_s390.h |  1 +
+ arch/s390/kvm/s390/gaccess.c          | 12 ++++++++----
+ arch/s390/kvm/s390/priv.c             |  6 ++++--
+ arch/s390/kvm/s390/s390.c             |  9 +++++++++
+ 5 files changed, 30 insertions(+), 7 deletions(-)
+
+diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
+index 4bb6bd3612a8..1936420c0618 100644
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -9074,7 +9074,14 @@ loaded in ESA/390 mode and switch to z/Architecture themselves with SIGNAL
+ PROCESSOR (set architecture) need it.
+ 
+ In the mode, the vCPUs run on state descriptions without the z/Architecture
+-flag. As for KVM_CAP_S390_VSIE_ESAMODE, KVM cannot tell in advance whether
++flag. A machine without the configuration-z/Architecture-architectural-mode
++facility (facility bit 138 not installed on the host) runs them in ESA/390
++mode proper, including dynamic address translation: there a PSW with the DAT
++bit is valid in the mode, the guest accesses KVM makes for intercepted
++instructions are translated with the guest's ESA/390 segment and page tables
++(primary, secondary and home space; an access-register-mode operand fails
++the access with -EOPNOTSUPP), and KVM_S390_ESA390_CM_DAT is refused with
++-EINVAL. As for KVM_CAP_S390_VSIE_ESAMODE, KVM cannot tell in advance whether
+ the machine, or the hypervisor KVM runs under, accepts such state
+ descriptions. If it does not, KVM_RUN fails with -EINVAL after a validity
+ interception.
+diff --git a/arch/s390/include/asm/kvm_host_s390.h b/arch/s390/include/asm/kvm_host_s390.h
+index e12a2e7f61f4..2a2840aa38bb 100644
+--- a/arch/s390/include/asm/kvm_host_s390.h
++++ b/arch/s390/include/asm/kvm_host_s390.h
+@@ -640,6 +640,7 @@ struct kvm_arch {
+ 	bool esa390_cm;
+ 	bool esa390_cm_active;
+ 	bool esa390_dat;
++	bool esa390_native;
+ 	u64 user_ext_subclass;
+ 	struct s390_io_adapter *adapters[MAX_S390_IO_ADAPTERS];
+ 	wait_queue_head_t ipte_wq;
+diff --git a/arch/s390/kvm/s390/gaccess.c b/arch/s390/kvm/s390/gaccess.c
+index 71787fdb862a..6c79efbd49ed 100644
+--- a/arch/s390/kvm/s390/gaccess.c
++++ b/arch/s390/kvm/s390/gaccess.c
+@@ -417,7 +417,10 @@ static int get_vcpu_asce(struct kvm_vcpu *vcpu, union asce *asce,
+ 
+ 	if ((mode == GACC_IFETCH) && (psw.as != PSW_BITS_AS_HOME))
+ 		psw.as = PSW_BITS_AS_PRIMARY;
+-	/* ESA/390 DAT shadowing provides no access-register translation */
++	/*
++	 * Access-register translation is not provided in ESA/390 format, for
++	 * ESA/390 DAT shadowing nor on a machine that runs ESA/390 itself.
++	 */
+ 	if (kvm_s390_vcpu_is_esa(vcpu) && psw.as == PSW_BITS_AS_ACCREG)
+ 		return -EOPNOTSUPP;
+ 
+@@ -631,9 +634,10 @@ static unsigned long guest_translate_gva(struct kvm_vcpu *vcpu, unsigned long gv
+ }
+ 
+ /*
+- * ESA/390 translation for accesses KVM makes on behalf of the guest. Only
+- * the primary space exists; the caller has checked the address-space
+- * control.
++ * ESA/390 translation for accesses KVM makes on behalf of the guest, in the
++ * space the caller selected: with ESA/390 DAT shadowing only the primary and
++ * the home space exist, on a machine that runs ESA/390 itself (no facility
++ * 138) also the secondary space.
+  */
+ static int esa390_translate_gva(struct kvm_vcpu *vcpu, unsigned long gva, unsigned long *gpa,
+ 				const union asce asce, enum gacc_mode mode, enum prot_type *prot)
+diff --git a/arch/s390/kvm/s390/priv.c b/arch/s390/kvm/s390/priv.c
+index 6c35a421266b..b0669712c61c 100644
+--- a/arch/s390/kvm/s390/priv.c
++++ b/arch/s390/kvm/s390/priv.c
+@@ -718,14 +718,16 @@ int is_valid_psw(psw_t *psw)
+ /*
+  * Validity of a PSW (in the 16-byte format) for the mode the vCPU is in.
+  * The ESA/390-compatibility mode knows neither dynamic address translation
+- * nor the 64-bit addressing mode.
++ * nor the 64-bit addressing mode. On a machine that still runs ESA/390 itself
++ * (no facility 138) the mode is ESA/390 proper, with dynamic address
++ * translation.
+  */
+ int kvm_s390_is_valid_psw(struct kvm_vcpu *vcpu, psw_t *psw)
+ {
+ 	if (kvm_s390_vcpu_is_esa(vcpu) && (psw->mask & PSW_MASK_EA))
+ 		return 0;
+ 	if (kvm_s390_vcpu_is_esa(vcpu) && (psw->mask & PSW_MASK_DAT) &&
+-	    !vcpu->kvm->arch.esa390_dat)
++	    !vcpu->kvm->arch.esa390_dat && !vcpu->kvm->arch.esa390_native)
+ 		return 0;
+ 	/*
+ 	 * An odd instruction address is recognized when an instruction is
+diff --git a/arch/s390/kvm/s390/s390.c b/arch/s390/kvm/s390/s390.c
+index 5ecd453c2327..e24337686838 100644
+--- a/arch/s390/kvm/s390/s390.c
++++ b/arch/s390/kvm/s390/s390.c
+@@ -956,9 +956,18 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm, struct kvm_enable_cap *cap)
+ 		} else if (kvm_is_ucontrol(kvm) || !kvm->arch.user_sigp ||
+ 			   cap->args[0] & ~KVM_S390_ESA390_CM_DAT) {
+ 			r = -EINVAL;
++		} else if ((cap->args[0] & KVM_S390_ESA390_CM_DAT) && !test_facility(138)) {
++			/*
++			 * A machine without the configuration-z/Architecture-
++			 * architectural-mode facility runs such state
++			 * descriptions in ESA/390 mode proper: it translates
++			 * ESA/390 addresses itself, there is nothing to shadow.
++			 */
++			r = -EINVAL;
+ 		} else {
+ 			kvm->arch.esa390_cm = true;
+ 			kvm->arch.esa390_dat = cap->args[0] & KVM_S390_ESA390_CM_DAT;
++			kvm->arch.esa390_native = !test_facility(138);
+ 			kvm_s390_update_fac_arch_mode(kvm);
+ 			r = 0;
+ 		}
+-- 
+2.47.3
+

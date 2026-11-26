@@ -1,4 +1,4 @@
-From 4e51c436fb0ef9947997138f1e610fed552014f9 Mon Sep 17 00:00:00 2001
+From ac0373ef4c5696c3ca5d4a79e7dcd0eacecb302a Mon Sep 17 00:00:00 2001
 From: Yvan Janssens <yvanj@cyber.gent>
 Date: Thu, 26 Nov 2026 11:05:16 +0100
 Subject: [RFC PATCH 4/4] KVM: s390: selftests: Add a test for ESA/390 DAT
@@ -19,8 +19,8 @@ changes by the guest, that guest storage does not hold anything of the
 shadow, and the switch to z/Architecture.
 ---
  tools/testing/selftests/kvm/Makefile.kvm      |    1 +
- .../selftests/kvm/s390/esa390_dat_test.c      | 1041 +++++++++++++++++
- 2 files changed, 1042 insertions(+)
+ .../selftests/kvm/s390/esa390_dat_test.c      | 1059 +++++++++++++++++
+ 2 files changed, 1060 insertions(+)
  create mode 100644 tools/testing/selftests/kvm/s390/esa390_dat_test.c
 
 diff --git a/tools/testing/selftests/kvm/Makefile.kvm b/tools/testing/selftests/kvm/Makefile.kvm
@@ -37,10 +37,10 @@ index ff9f9740b904..9041acc15fea 100644
  TEST_GEN_PROGS_s390 += mmu_stress_test
 diff --git a/tools/testing/selftests/kvm/s390/esa390_dat_test.c b/tools/testing/selftests/kvm/s390/esa390_dat_test.c
 new file mode 100644
-index 000000000000..39bef3b2051a
+index 000000000000..9c47b64b348e
 --- /dev/null
 +++ b/tools/testing/selftests/kvm/s390/esa390_dat_test.c
-@@ -0,0 +1,1041 @@
+@@ -0,0 +1,1059 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Test ESA/390 DAT shadowing (KVM_CAP_S390_ESA390_CM, KVM_S390_ESA390_CM_DAT).
@@ -465,22 +465,35 @@ index 000000000000..39bef3b2051a
 +}
 +
 +/* the shadow follows the guest's purges, not its stores */
++/*
++ * The purges drop shadows, and the next one may be built in the same pages
++ * with the same ASCE: repeated, so that the machine's own translations for
++ * that ASCE would be found if they survived.
++ */
++#define PURGE_ROUNDS	100
++
 +static void test_purge(struct kvm_vcpu *vcpu)
 +{
-+	int n1, n2, n3;
-+	u32 a, b;
++	int n1, n2, n3, i, bad = 0;
++	u32 a = 0, b = 0;
 +
-+	wr32(PTO1 + 3 * 4, R_DATA_A);
-+	n1 = run(vcpu, gaddr(g_load), true, V_DATA, 0, 0);
-+	a = gpr(vcpu, 1);
-+	/* change the valid entry and purge: the new mapping must be used */
-+	wr32(PTO1 + 3 * 4, R_DATA_B);
-+	n2 = run(vcpu, gaddr(g_ptlb), false, 0, 0, 0);
-+	n3 = run(vcpu, gaddr(g_load), true, V_DATA, 0, 0);
-+	b = gpr(vcpu, 1);
-+	ksft_test_result(n1 == EXIT_DONE && n2 == EXIT_DONE && n3 == EXIT_DONE &&
-+			 a == 0xaaaaaaaa && b == 0xbbbbbbbb,
-+			 "PTLB after a table change (%08x then %08x)\n", a, b);
++	for (i = 0; i < PURGE_ROUNDS; i++) {
++		wr32(PTO1 + 3 * 4, R_DATA_A);
++		TEST_ASSERT_EQ(run(vcpu, gaddr(g_ptlb), false, 0, 0, 0), EXIT_DONE);
++		n1 = run(vcpu, gaddr(g_load), true, V_DATA, 0, 0);
++		a = gpr(vcpu, 1);
++		/* change the valid entry and purge: the new mapping must be used */
++		wr32(PTO1 + 3 * 4, R_DATA_B);
++		n2 = run(vcpu, gaddr(g_ptlb), false, 0, 0, 0);
++		n3 = run(vcpu, gaddr(g_load), true, V_DATA, 0, 0);
++		b = gpr(vcpu, 1);
++		if (n1 != EXIT_DONE || n2 != EXIT_DONE || n3 != EXIT_DONE ||
++		    a != 0xaaaaaaaa || b != 0xbbbbbbbb)
++			bad++;
++	}
++	ksft_test_result(!bad,
++			 "PTLB after a table change, %d rounds (%d wrong, last %08x then %08x)\n",
++			 PURGE_ROUNDS, bad, a, b);
 +
 +	/* IPTE: invalid bit set in guest storage, translation gone */
 +	n1 = run(vcpu, gaddr(g_ipte), false, V_DATA, 0, PTO1);
@@ -491,16 +504,21 @@ index 000000000000..39bef3b2051a
 +			 rd32(PTO1 + 12), rd16(LC_PGM_CODE + 2));
 +
 +	/* CSP with the purge bit, from translated code */
-+	wr32(PTO1 + 3 * 4, R_DATA_A);
-+	wr32(0x3000, 7);
-+	n1 = run(vcpu, gaddr(g_load), true, V_DATA, 0, 0);
-+	wr32(PTO1 + 3 * 4, R_DATA_B);
-+	n2 = run(vcpu, gaddr(g_csp), true, 0x3000 | 1, 0, 7);
-+	n3 = run(vcpu, gaddr(g_load), true, V_DATA, 0, 0);
-+	ksft_test_result(n1 == EXIT_DONE && n2 == EXIT_DONE &&
-+			 !((gpr(vcpu, 3) >> 28) & 3) && n3 == EXIT_DONE &&
-+			 gpr(vcpu, 1) == 0xbbbbbbbb,
-+			 "CSP with purge from translated code (r1 %08x)\n", gpr(vcpu, 1));
++	for (bad = 0, i = 0; i < PURGE_ROUNDS; i++) {
++		wr32(PTO1 + 3 * 4, R_DATA_A);
++		wr32(0x3000, 7);
++		TEST_ASSERT_EQ(run(vcpu, gaddr(g_ptlb), false, 0, 0, 0), EXIT_DONE);
++		n1 = run(vcpu, gaddr(g_load), true, V_DATA, 0, 0);
++		wr32(PTO1 + 3 * 4, R_DATA_B);
++		n2 = run(vcpu, gaddr(g_csp), true, 0x3000 | 1, 0, 7);
++		n3 = run(vcpu, gaddr(g_load), true, V_DATA, 0, 0);
++		if (n1 != EXIT_DONE || n2 != EXIT_DONE || ((gpr(vcpu, 3) >> 28) & 3) ||
++		    n3 != EXIT_DONE || gpr(vcpu, 1) != 0xbbbbbbbb)
++			bad++;
++	}
++	ksft_test_result(!bad,
++			 "CSP with purge from translated code, %d rounds (%d wrong, last r1 %08x)\n",
++			 PURGE_ROUNDS, bad, gpr(vcpu, 1));
 +}
 +
 +/* the system-mask instructions see and change the guest's DAT bit */

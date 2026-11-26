@@ -11,3 +11,7 @@ kvm-esa390/0008-KVM-s390-Add-ESA-390-address-translation-and-shadow-.patch
 kvm-esa390/0009-KVM-s390-Run-ESA-390-DAT-on-code-on-shadow-address-s.patch
 kvm-esa390/0010-KVM-s390-Add-KVM_S390_ESA390_CM_DAT.patch
 kvm-esa390/0011-KVM-s390-selftests-Add-a-test-for-ESA-390-DAT-shadow.patch
+kvm-ext-irq/0001-KVM-s390-Let-user-space-inject-external-interruption.patch
+kvm-ext-irq/0002-KVM-s390-Exit-to-user-space-when-an-external-interru.patch
+kvm-ext-irq/0003-KVM-s390-selftests-Add-a-test-for-external-interrupt.patch
+kvm-esa390-native/0001-KVM-s390-Let-the-ESA-390-mode-use-the-machine-s-DAT-.patch

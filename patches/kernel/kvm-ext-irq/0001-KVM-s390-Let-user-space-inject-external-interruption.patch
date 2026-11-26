@@ -1,0 +1,417 @@
+From 6b15594b1e4dd650b0a398182f11625408a90f9d Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
+Date: Thu, 26 Nov 2026 13:50:35 +0100
+Subject: [PATCH 1/3] KVM: s390: Let user space inject external interruptions
+ it emulates
+
+Some external interruptions are defined by a hypervisor, not by the
+machine: z/VM presents those of its inter-user communication vehicle
+(IUCV) with code 0x4000, enabled by bit 62 of control register 0. A VMM
+that provides such a service in user space cannot present the
+interruption, because each injection type of KVM_S390_IRQ stands for one
+interruption that KVM itself knows.
+
+Add the type KVM_S390_INT_EXT_USER, an external interruption described
+by user space: its code, the control register 0 bits that enable it and,
+optionally, a CPU address and parameters to store. A vCPU holds at most
+one. KVM presents it like the other external interruptions, with the
+lowest priority among them, in the format of the architectural mode of
+the vCPU, and includes it in KVM_S390_GET_IRQ_STATE and
+KVM_S390_SET_IRQ_STATE.
+
+The capability KVM_CAP_S390_USER_EXT_IRQ makes the type available; its
+argument holds the control register 0 bits user space may use.
+
+---
+ Documentation/virt/kvm/api.rst        | 61 ++++++++++++++++++++++-
+ arch/s390/include/asm/kvm_host_s390.h |  6 +++
+ arch/s390/include/uapi/asm/kvm.h      | 17 +++++++
+ arch/s390/kvm/s390/interrupt.c        | 72 +++++++++++++++++++++++++++
+ arch/s390/kvm/s390/s390.c             | 16 ++++++
+ arch/s390/kvm/s390/trace-s390.h       |  1 +
+ include/uapi/linux/kvm.h              |  1 +
+ 7 files changed, 172 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
+index 4bb6bd3612a8..0669e38ec38a 100644
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -4096,11 +4096,15 @@ Errors:
+   EINVAL  interrupt type is invalid
+           type is KVM_S390_SIGP_STOP and flag parameter is invalid value,
+           type is KVM_S390_INT_EXTERNAL_CALL and code is bigger
+-          than the maximum of VCPUs
++          than the maximum of VCPUs,
++          type is KVM_S390_INT_EXT_USER and KVM_CAP_S390_USER_EXT_IRQ
++          is not enabled or a parameter is invalid
+   EBUSY   type is KVM_S390_SIGP_SET_PREFIX and vcpu is not stopped,
+           type is KVM_S390_SIGP_STOP and a stop irq is already pending,
+           type is KVM_S390_INT_EXTERNAL_CALL and an external call interrupt
+-          is already pending
++          is already pending,
++          type is KVM_S390_INT_EXT_USER and such an interrupt is already
++          pending
+   ======  =================================================================
+ 
+ Allows to inject an interrupt to the guest.
+@@ -4122,6 +4126,7 @@ Interrupt parameters are passed via kvm_s390_irq::
+ 		struct kvm_s390_prefix_info prefix;
+ 		struct kvm_s390_stop_info stop;
+ 		struct kvm_s390_mchk_info mchk;
++		struct kvm_s390_ext_user_info ext_user;
+ 		char reserved[64];
+ 	} u;
+   };
+@@ -4137,6 +4142,8 @@ type can be one of the following:
+ - KVM_S390_INT_EMERGENCY - sigp emergency; parameters in .emerg
+ - KVM_S390_INT_EXTERNAL_CALL - sigp external call; parameters in .extcall
+ - KVM_S390_MCHK - machine check interrupt; parameters in .mchk
++- KVM_S390_INT_EXT_USER - external interrupt emulated by user space;
++  parameters in .ext_user (see KVM_CAP_S390_USER_EXT_IRQ)
+ 
+ This is an asynchronous vcpu ioctl and can be invoked from any thread.
+ 
+@@ -9142,6 +9149,56 @@ and
+   into locations 0-511 (which gets the translation exception). Fetches from
+   such a page are not detected and return what KVM's page holds.
+ 
++7.49 KVM_CAP_S390_USER_EXT_IRQ
++------------------------------
++
++:Architectures: s390
++:Type: vm
++:Parameters: args[0] - control register 0 bits (external-interruption
++             subclass masks)
++:Returns: 0 on success; -EINVAL if args[0] is zero, another argument is not
++          zero, or the VM has the KVM_VM_S390_UCONTROL flag set.
++
++With this capability user space can present external interruptions that it
++emulates itself, for instance those of a hypervisor service that the guest
++calls with an instruction user space handles (see
++KVM_CAP_S390_USER_OPEREXEC). args[0] holds the bits of control register 0
++that enable these interruptions. The capability can be enabled again with
++other bits.
++
++Such an interruption is injected with KVM_S390_IRQ and the type
++KVM_S390_INT_EXT_USER::
++
++  struct kvm_s390_ext_user_info {
++	__u64 subclass;
++	__u16 code;
++	__u16 cpu_addr;
++	__u32 params;
++	__u64 params2;
++	__u32 flags;
++	__u32 reserved;
++  };
++
++  #define KVM_S390_EXT_USER_CPU_ADDR	0x01
++  #define KVM_S390_EXT_USER_PARAMS	0x02
++  #define KVM_S390_EXT_USER_PARAMS2	0x04
++
++subclass holds the bits of control register 0 that enable the interruption,
++a non-empty subset of args[0]. KVM presents the interruption when the vCPU
++is enabled for external interruptions and at least one of these bits is one,
++after the other external interruptions that are pending and enabled. It
++stores code as the external-interruption code, cpu_addr as the CPU address
++if flags has KVM_S390_EXT_USER_CPU_ADDR, params as the external-interruption
++parameter if flags has KVM_S390_EXT_USER_PARAMS, and params2 at the location
++of the second parameter if flags has KVM_S390_EXT_USER_PARAMS2 and the vCPU
++is in z/Architecture mode. The PSWs are swapped in the format of the
++architectural mode. reserved must be zero.
++
++A vCPU holds at most one interruption of this type; KVM_S390_IRQ returns
++-EBUSY while one is pending. KVM_S390_GET_IRQ_STATE and
++KVM_S390_SET_IRQ_STATE include it. The type is not available for protected
++vCPUs.
++
+ 8. Other capabilities.
+ ======================
+ 
+diff --git a/arch/s390/include/asm/kvm_host_s390.h b/arch/s390/include/asm/kvm_host_s390.h
+index e12a2e7f61f4..37d95f5b4355 100644
+--- a/arch/s390/include/asm/kvm_host_s390.h
++++ b/arch/s390/include/asm/kvm_host_s390.h
+@@ -78,6 +78,7 @@ struct kvm_vcpu_stat {
+ 	u64 deliver_emergency_signal;
+ 	u64 deliver_service_signal;
+ 	u64 deliver_virtio;
++	u64 deliver_ext_user;
+ 	u64 deliver_stop_signal;
+ 	u64 deliver_prefix_signal;
+ 	u64 deliver_restart_signal;
+@@ -88,6 +89,7 @@ struct kvm_vcpu_stat {
+ 	u64 inject_ckc;
+ 	u64 inject_cputm;
+ 	u64 inject_external_call;
++	u64 inject_ext_user;
+ 	u64 inject_emergency_signal;
+ 	u64 inject_mchk;
+ 	u64 inject_pfault_init;
+@@ -165,6 +167,7 @@ enum irq_types {
+ 	IRQ_PEND_IO_ISC_2,
+ 	IRQ_PEND_IO_ISC_1,
+ 	IRQ_PEND_IO_ISC_0,
++	IRQ_PEND_EXT_USER,
+ 	IRQ_PEND_VIRTIO,
+ 	IRQ_PEND_PFAULT_DONE,
+ 	IRQ_PEND_PFAULT_INIT,
+@@ -217,6 +220,7 @@ enum irq_types {
+ 			   (1UL << IRQ_PEND_EXT_SERVICE)    | \
+ 			   (1UL << IRQ_PEND_EXT_SERVICE_EV) | \
+ 			   (1UL << IRQ_PEND_VIRTIO)         | \
++			   (1UL << IRQ_PEND_EXT_USER)       | \
+ 			   (1UL << IRQ_PEND_PFAULT_INIT)    | \
+ 			   (1UL << IRQ_PEND_PFAULT_DONE))
+ 
+@@ -263,6 +267,7 @@ struct kvm_s390_irq_payload {
+ 	struct kvm_s390_prefix_info prefix;
+ 	struct kvm_s390_stop_info stop;
+ 	struct kvm_s390_mchk_info mchk;
++	struct kvm_s390_ext_user_info ext_user;
+ };
+ 
+ struct kvm_s390_local_interrupt {
+@@ -634,6 +639,7 @@ struct kvm_arch {
+ 	bool esa390_cm;
+ 	bool esa390_cm_active;
+ 	bool esa390_dat;
++	u64 user_ext_subclass;
+ 	struct s390_io_adapter *adapters[MAX_S390_IO_ADAPTERS];
+ 	wait_queue_head_t ipte_wq;
+ 	int ipte_lock_count;
+diff --git a/arch/s390/include/uapi/asm/kvm.h b/arch/s390/include/uapi/asm/kvm.h
+index 6ed6e2747cb9..2047b6e10ac7 100644
+--- a/arch/s390/include/uapi/asm/kvm.h
++++ b/arch/s390/include/uapi/asm/kvm.h
+@@ -105,6 +105,7 @@ struct kvm_s390_psw {
+ #define KVM_S390_RESTART		0xfffe0003u
+ #define KVM_S390_INT_PFAULT_INIT	0xfffe0004u
+ #define KVM_S390_INT_PFAULT_DONE	0xfffe0005u
++#define KVM_S390_INT_EXT_USER		0xfffe0006u
+ #define KVM_S390_MCHK			0xfffe1000u
+ #define KVM_S390_INT_CLOCK_COMP		0xffff1004u
+ #define KVM_S390_INT_CPU_TIMER		0xffff1005u
+@@ -171,6 +172,21 @@ struct kvm_s390_extcall_info {
+ 	__u16 code;
+ };
+ 
++/* an external interruption user space emulates, KVM_S390_INT_EXT_USER */
++struct kvm_s390_ext_user_info {
++	__u64 subclass;		/* control register 0 bits enabling it */
++	__u16 code;		/* external-interruption code */
++	__u16 cpu_addr;		/* with KVM_S390_EXT_USER_CPU_ADDR */
++	__u32 params;		/* with KVM_S390_EXT_USER_PARAMS */
++	__u64 params2;		/* with KVM_S390_EXT_USER_PARAMS2 */
++	__u32 flags;
++	__u32 reserved;
++};
++
++#define KVM_S390_EXT_USER_CPU_ADDR	0x01
++#define KVM_S390_EXT_USER_PARAMS	0x02
++#define KVM_S390_EXT_USER_PARAMS2	0x04
++
+ struct kvm_s390_emerg_info {
+ 	__u16 code;
+ };
+@@ -200,6 +216,7 @@ struct kvm_s390_irq {
+ 		struct kvm_s390_prefix_info prefix;
+ 		struct kvm_s390_stop_info stop;
+ 		struct kvm_s390_mchk_info mchk;
++		struct kvm_s390_ext_user_info ext_user;
+ 		char reserved[64];
+ 	} u;
+ };
+diff --git a/arch/s390/kvm/s390/interrupt.c b/arch/s390/kvm/s390/interrupt.c
+index f5535a6cd4c1..f06ef5de3376 100644
+--- a/arch/s390/kvm/s390/interrupt.c
++++ b/arch/s390/kvm/s390/interrupt.c
+@@ -346,6 +346,9 @@ static unsigned long deliverable_irqs(struct kvm_vcpu *vcpu)
+ 		__clear_bit(IRQ_PEND_EXT_SERVICE, &active_mask);
+ 		__clear_bit(IRQ_PEND_EXT_SERVICE_EV, &active_mask);
+ 	}
++	if (!(vcpu->arch.sie_block->gcr[0] &
++	      READ_ONCE(vcpu->arch.local_int.irq.ext_user.subclass)))
++		__clear_bit(IRQ_PEND_EXT_USER, &active_mask);
+ 	if (psw_mchk_disabled(vcpu))
+ 		active_mask &= ~IRQ_PEND_MCHK_MASK;
+ 	/* PV guest cpus can have a single interruption injected at a time. */
+@@ -926,6 +929,37 @@ static int __must_check __deliver_external_call(struct kvm_vcpu *vcpu)
+ 	return rc ? -EFAULT : 0;
+ }
+ 
++static int __must_check __deliver_ext_user(struct kvm_vcpu *vcpu)
++{
++	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
++	struct kvm_s390_ext_user_info ext;
++	int rc;
++
++	spin_lock(&li->lock);
++	ext = li->irq.ext_user;
++	memset(&li->irq.ext_user, 0, sizeof(li->irq.ext_user));
++	clear_bit(IRQ_PEND_EXT_USER, &li->pending_irqs);
++	spin_unlock(&li->lock);
++
++	VCPU_EVENT(vcpu, 4, "deliver: user external 0x%x", ext.code);
++	vcpu->stat.deliver_ext_user++;
++	trace_kvm_s390_deliver_interrupt(vcpu->vcpu_id, KVM_S390_INT_EXT_USER,
++					 ext.code, ext.params);
++
++	rc = put_guest_lc(vcpu, ext.code, (u16 *)__LC_EXT_INT_CODE);
++	if (ext.flags & KVM_S390_EXT_USER_CPU_ADDR)
++		rc |= put_guest_lc(vcpu, ext.cpu_addr, (u16 *)__LC_EXT_CPU_ADDR);
++	if (ext.flags & KVM_S390_EXT_USER_PARAMS)
++		rc |= put_guest_lc(vcpu, ext.params, (u32 *)__LC_EXT_PARAMS);
++	/* ESA/390 has no second parameter */
++	if ((ext.flags & KVM_S390_EXT_USER_PARAMS2) &&
++	    !kvm_s390_vcpu_is_esa(vcpu))
++		rc |= put_guest_lc(vcpu, ext.params2, (u64 *)__LC_EXT_PARAMS2);
++	rc |= kvm_s390_lc_store_old_psw(vcpu, __LC_EXT_OLD_PSW);
++	rc |= kvm_s390_lc_load_new_psw(vcpu, __LC_EXT_NEW_PSW);
++	return rc ? -EFAULT : 0;
++}
++
+ static int __deliver_prog_pv(struct kvm_vcpu *vcpu, u16 code)
+ {
+ 	switch (code) {
+@@ -1636,6 +1670,9 @@ int __must_check kvm_s390_deliver_pending_interrupts(struct kvm_vcpu *vcpu)
+ 		case IRQ_PEND_VIRTIO:
+ 			rc = __deliver_virtio(vcpu);
+ 			break;
++		case IRQ_PEND_EXT_USER:
++			rc = __deliver_ext_user(vcpu);
++			break;
+ 		default:
+ 			WARN_ONCE(1, "Unknown pending irq type %ld", irq_type);
+ 			clear_bit(irq_type, &li->pending_irqs);
+@@ -2315,6 +2352,34 @@ void kvm_s390_clear_stop_irq(struct kvm_vcpu *vcpu)
+ 	spin_unlock(&li->lock);
+ }
+ 
++#define KVM_S390_EXT_USER_FLAGS (KVM_S390_EXT_USER_CPU_ADDR | \
++				 KVM_S390_EXT_USER_PARAMS | \
++				 KVM_S390_EXT_USER_PARAMS2)
++
++static int __inject_ext_user(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq)
++{
++	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
++	struct kvm_s390_ext_user_info *ext = &irq->u.ext_user;
++	u64 subclass = READ_ONCE(vcpu->kvm->arch.user_ext_subclass);
++
++	if (!ext->subclass || ext->subclass & ~subclass ||
++	    ext->flags & ~KVM_S390_EXT_USER_FLAGS || ext->reserved ||
++	    kvm_s390_pv_cpu_get_handle(vcpu))
++		return -EINVAL;
++	if (test_bit(IRQ_PEND_EXT_USER, &li->pending_irqs))
++		return -EBUSY;
++
++	vcpu->stat.inject_ext_user++;
++	VCPU_EVENT(vcpu, 3, "inject: user external 0x%x", ext->code);
++	trace_kvm_s390_inject_vcpu(vcpu->vcpu_id, KVM_S390_INT_EXT_USER,
++				   ext->code, ext->params);
++
++	li->irq.ext_user = *ext;
++	set_bit(IRQ_PEND_EXT_USER, &li->pending_irqs);
++	kvm_s390_set_cpuflags(vcpu, CPUSTAT_EXT_INT);
++	return 0;
++}
++
+ static int do_inject_vcpu(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq, bool *storestatus)
+ {
+ 	int rc;
+@@ -2350,6 +2415,9 @@ static int do_inject_vcpu(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq, bool
+ 	case KVM_S390_INT_PFAULT_INIT:
+ 		rc = __inject_pfault_init(vcpu, irq);
+ 		break;
++	case KVM_S390_INT_EXT_USER:
++		rc = __inject_ext_user(vcpu, irq);
++		break;
+ 	case KVM_S390_INT_VIRTIO:
+ 	case KVM_S390_INT_SERVICE:
+ 	case KVM_S390_INT_IO_MIN...KVM_S390_INT_IO_MAX:
+@@ -3483,6 +3551,10 @@ static void store_local_irq(struct kvm_s390_local_interrupt *li,
+ 	case IRQ_PEND_RESTART:
+ 		irq->type = KVM_S390_RESTART;
+ 		break;
++	case IRQ_PEND_EXT_USER:
++		irq->type = KVM_S390_INT_EXT_USER;
++		irq->u.ext_user = li->irq.ext_user;
++		break;
+ 	case IRQ_PEND_SET_PREFIX:
+ 		irq->type = KVM_S390_SIGP_SET_PREFIX;
+ 		irq->u.prefix = li->irq.prefix;
+diff --git a/arch/s390/kvm/s390/s390.c b/arch/s390/kvm/s390/s390.c
+index 5ecd453c2327..6803c89d9d50 100644
+--- a/arch/s390/kvm/s390/s390.c
++++ b/arch/s390/kvm/s390/s390.c
+@@ -123,6 +123,7 @@ const struct kvm_stats_desc kvm_vcpu_stats_desc[] = {
+ 	STATS_DESC_COUNTER(VCPU, deliver_emergency_signal),
+ 	STATS_DESC_COUNTER(VCPU, deliver_service_signal),
+ 	STATS_DESC_COUNTER(VCPU, deliver_virtio),
++	STATS_DESC_COUNTER(VCPU, deliver_ext_user),
+ 	STATS_DESC_COUNTER(VCPU, deliver_stop_signal),
+ 	STATS_DESC_COUNTER(VCPU, deliver_prefix_signal),
+ 	STATS_DESC_COUNTER(VCPU, deliver_restart_signal),
+@@ -133,6 +134,7 @@ const struct kvm_stats_desc kvm_vcpu_stats_desc[] = {
+ 	STATS_DESC_COUNTER(VCPU, inject_ckc),
+ 	STATS_DESC_COUNTER(VCPU, inject_cputm),
+ 	STATS_DESC_COUNTER(VCPU, inject_external_call),
++	STATS_DESC_COUNTER(VCPU, inject_ext_user),
+ 	STATS_DESC_COUNTER(VCPU, inject_emergency_signal),
+ 	STATS_DESC_COUNTER(VCPU, inject_mchk),
+ 	STATS_DESC_COUNTER(VCPU, inject_pfault_init),
+@@ -726,6 +728,9 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	case KVM_CAP_S390_CPU_TOPOLOGY:
+ 		r = test_facility(11);
+ 		break;
++	case KVM_CAP_S390_USER_EXT_IRQ:
++		r = !(kvm && kvm_is_ucontrol(kvm));
++		break;
+ 	case KVM_CAP_S390_ESA390_CM:
+ 		/*
+ 		 * Like KVM_CAP_S390_VSIE_ESAMODE, this relies on SIE accepting
+@@ -966,6 +971,17 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm, struct kvm_enable_cap *cap)
+ 		VM_EVENT(kvm, 3, "ENABLE: CAP_S390_ESA390_CM %s",
+ 			 r ? "(not available)" : "(success)");
+ 		break;
++	case KVM_CAP_S390_USER_EXT_IRQ:
++		if (kvm_is_ucontrol(kvm) || !cap->args[0] || cap->args[1] ||
++		    cap->args[2] || cap->args[3]) {
++			r = -EINVAL;
++		} else {
++			WRITE_ONCE(kvm->arch.user_ext_subclass, cap->args[0]);
++			r = 0;
++		}
++		VM_EVENT(kvm, 3, "ENABLE: CAP_S390_USER_EXT_IRQ 0x%llx %s",
++			 cap->args[0], r ? "(not available)" : "(success)");
++		break;
+ 	default:
+ 		r = -EINVAL;
+ 		break;
+diff --git a/arch/s390/kvm/s390/trace-s390.h b/arch/s390/kvm/s390/trace-s390.h
+index 9e28f165c114..245c15afa6ec 100644
+--- a/arch/s390/kvm/s390/trace-s390.h
++++ b/arch/s390/kvm/s390/trace-s390.h
+@@ -108,6 +108,7 @@ TRACE_EVENT(kvm_s390_vcpu_start_stop,
+ 	{KVM_S390_RESTART, "sigp restart"},				\
+ 	{KVM_S390_INT_PFAULT_INIT, "pfault init"},			\
+ 	{KVM_S390_INT_PFAULT_DONE, "pfault done"},			\
++	{KVM_S390_INT_EXT_USER, "user external"},			\
+ 	{KVM_S390_MCHK, "machine check"},				\
+ 	{KVM_S390_INT_CLOCK_COMP, "clock comparator"},			\
+ 	{KVM_S390_INT_CPU_TIMER, "cpu timer"},				\
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+index 5aba1c564621..f397ec0606e5 100644
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -1000,6 +1000,7 @@ struct kvm_enable_cap {
+ #define KVM_CAP_PPC_COMPAT_CAPS 250
+ #define KVM_CAP_ARM_PMU_V3_STRICT 251
+ #define KVM_CAP_S390_ESA390_CM 253
++#define KVM_CAP_S390_USER_EXT_IRQ 254
+ 
+ struct kvm_irq_routing_irqchip {
+ 	__u32 irqchip;
+-- 
+2.47.3
+

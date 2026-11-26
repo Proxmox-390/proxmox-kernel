@@ -1,3 +1,19 @@
+proxmox-kernel-7.3 (7.3.6-1+s390x7) trixie; urgency=medium
+
+  * KVM: s390: ESA/390 DAT shadowing: purge the guest TLB when the vCPU
+    switches to another shadow address space.
+  * KVM: s390: let user space inject the external interruptions it
+    emulates and exit to user space when such an interruption can be
+    presented (capability KVM_CAP_S390_USER_EXT_IRQ); with a selftest.
+  * KVM: s390: on hosts without the CZAM facility (z196, z114, zEC12,
+    zBC12) let the ESA/390-compatibility mode use the machine's own DAT;
+    no change on newer machines.
+  * Interim build: the binary packages were built incrementally in the
+    build tree of 7.3.6-1+s390x6 (only the changed objects rebuilt); a
+    later version will be a clean build from this source.
+
+ -- Yvan Janssens <yvanj@cyber.gent>  Thu, 26 Nov 2026 19:28:10 +0000
+
 proxmox-kernel-7.3 (7.3.6-1+s390x6) trixie; urgency=medium
 
   * KVM: s390: ESA/390-compatibility mode for first-level guests

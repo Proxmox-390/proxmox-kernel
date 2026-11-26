@@ -1,0 +1,201 @@
+From c5637e4a78a92195d4e384023c6ffa6c5d5b5316 Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
+Date: Thu, 26 Nov 2026 13:51:25 +0100
+Subject: [PATCH 2/3] KVM: s390: Exit to user space when an external
+ interruption can be presented
+
+An external interruption of z/VM's inter-user communication vehicle
+comes with 40 bytes of data that the hypervisor stores into a buffer the
+guest declared, at the time it presents the interruption: the guest
+copies the data in its interruption handler and the next interruption
+overwrites them. A VMM that emulates this service in user space has to
+store the data at that time too, so it needs to know when the vCPU can
+take the interruption.
+
+x86 solved the same problem for interrupt controllers emulated in user
+space with request_interrupt_window in struct kvm_run, the exit reason
+KVM_EXIT_IRQ_WINDOW_OPEN and ready_for_interrupt_injection: user space
+asks to be told when the vCPU can take an interrupt and injects it with
+KVM_INTERRUPT then. Do the same on s390 for KVM_CAP_S390_USER_EXT_IRQ:
+with request_interrupt_window set, KVM_RUN returns instead of entering
+SIE while the vCPU is enabled for external interruptions and for one of
+the subclasses of the capability, and no interruption of user space is
+pending. ready_for_interrupt_injection reports the same condition after
+each KVM_RUN. While the vCPU is not enabled, the existing intervention
+requests (external-interruption request, interception of LOAD CONTROL
+for control register 0) bring it back to KVM when it enables itself, as
+for a pending interruption, and an enabled wait ends the wait.
+
+An interruption injected at that point is presented before the guest
+executes another instruction, through the usual delivery path.
+
+---
+ Documentation/virt/kvm/api.rst        | 23 ++++++++++++++++++-
+ arch/s390/include/asm/kvm_host_s390.h |  1 +
+ arch/s390/kvm/s390/interrupt.c        | 33 ++++++++++++++++++++++++++-
+ arch/s390/kvm/s390/s390.c             |  8 +++++++
+ arch/s390/kvm/s390/s390.h             |  2 ++
+ 5 files changed, 65 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
+index 0669e38ec38a..302393fb741b 100644
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -6689,6 +6689,7 @@ looking up structure members.
+ 
+ Request that KVM_RUN return when it becomes possible to inject external
+ interrupts into the guest.  Useful in conjunction with KVM_INTERRUPT.
++On s390, see KVM_CAP_S390_USER_EXT_IRQ.
+ 
+ ::
+ 
+@@ -6719,7 +6720,8 @@ field are detailed below.
+ 	__u8 ready_for_interrupt_injection;
+ 
+ If request_interrupt_window has been specified, this field indicates
+-an interrupt can be injected now with KVM_INTERRUPT.
++an interrupt can be injected now with KVM_INTERRUPT (on s390, with
++KVM_S390_IRQ, see KVM_CAP_S390_USER_EXT_IRQ).
+ 
+ ::
+ 
+@@ -9199,6 +9201,25 @@ A vCPU holds at most one interruption of this type; KVM_S390_IRQ returns
+ KVM_S390_SET_IRQ_STATE include it. The type is not available for protected
+ vCPUs.
+ 
++Interruptions that come with data that user space stores in guest memory
++must be injected at the time they can be presented. For this, user space
++sets request_interrupt_window in struct kvm_run (as with KVM_INTERRUPT on
++other architectures). KVM_RUN then returns with the exit reason
++KVM_EXIT_IRQ_WINDOW_OPEN instead of letting the vCPU run while
++
++- no interruption of this type is pending for the vCPU,
++- the vCPU is enabled for external interruptions, and
++- at least one bit of args[0] is one in control register 0.
++
++KVM has then presented all other interruptions that were pending and
++enabled. KVM sets ready_for_interrupt_injection in struct kvm_run to tell
++whether these conditions hold whenever KVM_RUN returns. An interruption
++injected then is presented on the next KVM_RUN before the guest executes an
++instruction, unless an enabled interruption with higher priority became
++pending in between; it then stays pending until the vCPU is enabled for it
++again. A vCPU in the enabled wait state counts as running for this
++purpose.
++
+ 8. Other capabilities.
+ ======================
+ 
+diff --git a/arch/s390/include/asm/kvm_host_s390.h b/arch/s390/include/asm/kvm_host_s390.h
+index 37d95f5b4355..8862e0f2e011 100644
+--- a/arch/s390/include/asm/kvm_host_s390.h
++++ b/arch/s390/include/asm/kvm_host_s390.h
+@@ -72,6 +72,7 @@ struct kvm_vcpu_stat {
+ 	u64 exit_program_interruption;
+ 	u64 exit_instr_and_program;
+ 	u64 exit_operation_exception;
++	u64 exit_irq_window;
+ 	u64 deliver_ckc;
+ 	u64 deliver_cputm;
+ 	u64 deliver_external_call;
+diff --git a/arch/s390/kvm/s390/interrupt.c b/arch/s390/kvm/s390/interrupt.c
+index f06ef5de3376..2e34b9235398 100644
+--- a/arch/s390/kvm/s390/interrupt.c
++++ b/arch/s390/kvm/s390/interrupt.c
+@@ -411,9 +411,36 @@ static void set_intercept_indicators_io(struct kvm_vcpu *vcpu)
+ 		vcpu->arch.sie_block->lctl |= LCTL_CR6;
+ }
+ 
++/*
++ * KVM_CAP_S390_USER_EXT_IRQ: whether an interruption of user space could be
++ * presented now.
++ */
++bool kvm_s390_ext_user_ready(struct kvm_vcpu *vcpu)
++{
++	u64 subclass = READ_ONCE(vcpu->kvm->arch.user_ext_subclass);
++
++	return subclass && !kvm_s390_pv_cpu_get_handle(vcpu) &&
++	       !test_bit(IRQ_PEND_EXT_USER, &vcpu->arch.local_int.pending_irqs) &&
++	       !psw_extint_disabled(vcpu) &&
++	       (vcpu->arch.sie_block->gcr[0] & subclass);
++}
++
++static bool irq_window_requested(struct kvm_vcpu *vcpu)
++{
++	return vcpu->run->request_interrupt_window &&
++	       READ_ONCE(vcpu->kvm->arch.user_ext_subclass);
++}
++
++/* user space asked to be told when it can inject, and it can */
++bool kvm_s390_irq_window_open(struct kvm_vcpu *vcpu)
++{
++	return irq_window_requested(vcpu) && kvm_s390_ext_user_ready(vcpu);
++}
++
+ static void set_intercept_indicators_ext(struct kvm_vcpu *vcpu)
+ {
+-	if (!(pending_irqs_no_gisa(vcpu) & IRQ_PEND_EXT_MASK))
++	if (!(pending_irqs_no_gisa(vcpu) & IRQ_PEND_EXT_MASK) &&
++	    !irq_window_requested(vcpu))
+ 		return;
+ 	if (psw_extint_disabled(vcpu))
+ 		kvm_s390_set_cpuflags(vcpu, CPUSTAT_EXT_INT);
+@@ -1452,6 +1479,10 @@ int kvm_s390_vcpu_has_irq(struct kvm_vcpu *vcpu, int exclude_stop)
+ 
+ 	if (!exclude_stop && kvm_s390_is_stop_irq_pending(vcpu))
+ 		return 1;
++
++	/* user space has to be told */
++	if (kvm_s390_irq_window_open(vcpu))
++		return 1;
+ 	return 0;
+ }
+ 
+diff --git a/arch/s390/kvm/s390/s390.c b/arch/s390/kvm/s390/s390.c
+index 6803c89d9d50..d0672b812dac 100644
+--- a/arch/s390/kvm/s390/s390.c
++++ b/arch/s390/kvm/s390/s390.c
+@@ -117,6 +117,7 @@ const struct kvm_stats_desc kvm_vcpu_stats_desc[] = {
+ 	STATS_DESC_COUNTER(VCPU, exit_program_interruption),
+ 	STATS_DESC_COUNTER(VCPU, exit_instr_and_program),
+ 	STATS_DESC_COUNTER(VCPU, exit_operation_exception),
++	STATS_DESC_COUNTER(VCPU, exit_irq_window),
+ 	STATS_DESC_COUNTER(VCPU, deliver_ckc),
+ 	STATS_DESC_COUNTER(VCPU, deliver_cputm),
+ 	STATS_DESC_COUNTER(VCPU, deliver_external_call),
+@@ -4734,6 +4735,12 @@ static int vcpu_pre_run(struct kvm_vcpu *vcpu)
+ 	if (rc)
+ 		return rc;
+ 
++	if (kvm_s390_irq_window_open(vcpu)) {
++		vcpu->run->exit_reason = KVM_EXIT_IRQ_WINDOW_OPEN;
++		vcpu->stat.exit_irq_window++;
++		return -EREMOTE;
++	}
++
+ 	if (kvm_s390_esa390_dat_enabled(vcpu)) {
+ 		rc = kvm_s390_esa390_dat_enter(vcpu);
+ 		if (rc)
+@@ -5287,6 +5294,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 		rc = 0;
+ 	}
+ 
++	kvm_run->ready_for_interrupt_injection = kvm_s390_ext_user_ready(vcpu);
+ 	disable_cpu_timer_accounting(vcpu);
+ 	store_regs(vcpu);
+ 	kernel_fpu_end(&fpu, KERNEL_FPC | KERNEL_VXR);
+diff --git a/arch/s390/kvm/s390/s390.h b/arch/s390/kvm/s390/s390.h
+index 62a43764f4a3..ff00d487a0fe 100644
+--- a/arch/s390/kvm/s390/s390.h
++++ b/arch/s390/kvm/s390/s390.h
+@@ -646,6 +646,8 @@ int s390int_to_s390irq(struct kvm_s390_interrupt *s390int,
+ 
+ /* implemented in interrupt.c */
+ int kvm_s390_vcpu_has_irq(struct kvm_vcpu *vcpu, int exclude_stop);
++bool kvm_s390_ext_user_ready(struct kvm_vcpu *vcpu);
++bool kvm_s390_irq_window_open(struct kvm_vcpu *vcpu);
+ int psw_extint_disabled(struct kvm_vcpu *vcpu);
+ void kvm_s390_destroy_adapters(struct kvm *kvm);
+ int kvm_s390_ext_call_pending(struct kvm_vcpu *vcpu);
+-- 
+2.47.3
+

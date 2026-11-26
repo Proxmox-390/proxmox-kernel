@@ -1,0 +1,532 @@
+From 4d7c21bf4e5ba5a0c8eab04f637bcf8837567826 Mon Sep 17 00:00:00 2001
+From: Yvan Janssens <yvanj@cyber.gent>
+Date: Thu, 26 Nov 2026 13:56:07 +0100
+Subject: [PATCH 3/3] KVM: s390: selftests: Add a test for external
+ interruptions of user space
+
+Check the parameters of KVM_CAP_S390_USER_EXT_IRQ and of the injection
+type KVM_S390_INT_EXT_USER, the interrupt window exit after LOAD
+CONTROL, after STORE THEN OR SYSTEM MASK and in the enabled wait, what
+is stored with and without the flags, that a second injection is
+refused while one is pending, that the pending interruption is part of
+the interrupt state, that it has lower priority than an emergency
+signal, and, where the ESA/390-compatibility mode is available, that it
+is presented in ESA/390 format.
+
+---
+ tools/testing/selftests/kvm/Makefile.kvm      |   1 +
+ .../selftests/kvm/s390/user_ext_irq_test.c    | 490 ++++++++++++++++++
+ 2 files changed, 491 insertions(+)
+ create mode 100644 tools/testing/selftests/kvm/s390/user_ext_irq_test.c
+
+diff --git a/tools/testing/selftests/kvm/Makefile.kvm b/tools/testing/selftests/kvm/Makefile.kvm
+index 9041acc15fea..c43eefb384d7 100644
+--- a/tools/testing/selftests/kvm/Makefile.kvm
++++ b/tools/testing/selftests/kvm/Makefile.kvm
+@@ -223,6 +223,7 @@ TEST_GEN_PROGS_s390 += s390/keyop
+ TEST_GEN_PROGS_s390 += s390/vsie_esa_test
+ TEST_GEN_PROGS_s390 += s390/esa390_cm_test
+ TEST_GEN_PROGS_s390 += s390/esa390_dat_test
++TEST_GEN_PROGS_s390 += s390/user_ext_irq_test
+ TEST_GEN_PROGS_s390 += rseq_test
+ TEST_GEN_PROGS_s390 += s390/irq_routing
+ TEST_GEN_PROGS_s390 += mmu_stress_test
+diff --git a/tools/testing/selftests/kvm/s390/user_ext_irq_test.c b/tools/testing/selftests/kvm/s390/user_ext_irq_test.c
+new file mode 100644
+index 000000000000..4288e245e675
+--- /dev/null
++++ b/tools/testing/selftests/kvm/s390/user_ext_irq_test.c
+@@ -0,0 +1,490 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Test external interruptions emulated by user space
++ * (KVM_CAP_S390_USER_EXT_IRQ, KVM_S390_INT_EXT_USER) and the interrupt
++ * window exit that tells user space when to inject them.
++ *
++ * The guest is a small program without dynamic address translation. The
++ * interruption used is the one of z/VM's inter-user communication vehicle:
++ * code 0x4000, enabled by bit 62 of control register 0.
++ */
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++
++#include "kvm_util.h"
++#include "test_util.h"
++#include "kselftest.h"
++#include "sie.h"
++
++#define GUEST_MEM_PAGES		64
++#define GUEST_CODE		0x2000UL
++
++/* guest data, addressable without a base register */
++#define D_CR0		0xe80
++#define D_CR0_EMERG	0xe88
++#define D_PSW_WAIT	0xe90
++#define D_COUNT		0xea0
++#define D_CODES		0xeb0
++
++/* z/Architecture assigned storage locations */
++#define LC_EXT_PARAMS	0x80
++#define LC_EXT_CPU_ADDR	0x84
++#define LC_EXT_CODE	0x86
++#define LC_EXT_OLD	0x130
++#define LC_RST_NEW	0x1a0
++#define LC_EXT_NEW	0x1b0
++#define LC_SVC_NEW	0x1c0
++#define LC_PGM_NEW	0x1d0
++#define LC_MCK_NEW	0x1e0
++#define LC_IO_NEW	0x1f0
++#define LC_EXT_PARAMS2	0x11b8
++
++/* ESA/390 assigned storage locations */
++#define ESA_EXT_OLD	24
++#define ESA_EXT_NEW	88
++#define ESA_PSW_BIT12	0x00080000U
++#define ESA_PSW_AMODE31	0x80000000U
++#define ESA_PSW_EXT	0x01000000U
++#define ESA_PSW_WAIT	0x00020000U
++
++#define PSW_MASK_EXT	0x0100000000000000ULL
++#define PSW_MASK_WAIT	0x0002000000000000ULL
++#define PSW_MASK_64	0x0000000180000000ULL
++
++#define CR0_IUCV	0x0000000000000002ULL	/* bit 62 */
++#define CR0_EMERGENCY	0x0000000000004000ULL	/* bit 49 */
++#define CR0_RESET	0x00000000000000e0ULL
++
++#define EXT_IUCV	0x4000
++#define EXT_EMERGENCY	0x1201
++
++/* exits of the guest: DIAGNOSE 0x501 with the number as r1 */
++enum guest_exit {
++	EXIT_EXT = 1, EXIT_PGM, EXIT_OTHER, EXIT_DONE,
++};
++
++extern char guest_start[], guest_end[];
++extern char g_lctl[], g_lctl_done[], g_stosm[], g_stosm_done[], g_wait[];
++extern char g_disabled[], g_enable[], g_enabled_loop[];
++extern char g_esa[], s_ext[], s_pgm[], s_other[], s_multi[];
++
++asm("	.pushsection .rodata, \"a\"\n"
++	"	.balign	8\n"
++	"guest_start:\n"
++	/* enabled for external interruptions, subclass enabled late */
++	"g_lctl:\n"
++	"	lghi	%r5,1000\n"
++	"0:	brctg	%r5,0b\n"
++	"	lctlg	%c0,%c0,0xe80\n"
++	"g_lctl_done:\n"
++	"	j	g_lctl_done\n"
++	/* subclass enabled early, external interruptions late */
++	"g_stosm:\n"
++	"	lctlg	%c0,%c0,0xe80\n"
++	"	lghi	%r5,1000\n"
++	"0:	brctg	%r5,0b\n"
++	"	stosm	0xe70,0x01\n"
++	"g_stosm_done:\n"
++	"	j	g_stosm_done\n"
++	/* enabled wait */
++	"g_wait:\n"
++	"	lctlg	%c0,%c0,0xe80\n"
++	"	lpswe	0xe90\n"
++	/* disabled until user space resumes it at g_enable */
++	"g_disabled:\n"
++	"	lctlg	%c0,%c0,0xe88\n"
++	"	diag	4,0,0x501\n"
++	"g_enable:\n"
++	"	stosm	0xe70,0x01\n"
++	"g_enabled_loop:\n"
++	"	j	g_enabled_loop\n"
++	/* ESA/390: enabled wait with the subclass enabled */
++	"g_esa:\n"
++	"	lctl	%c0,%c0,0xe84\n"
++	"	lpsw	0xe98\n"
++	"s_ext:	diag	1,0,0x501\n"
++	"s_pgm:	diag	2,0,0x501\n"
++	"s_other:	diag	3,0,0x501\n"
++	/* count interruptions and their codes, exit after the second */
++	"s_multi:\n"
++	"	llgh	%r1,0x86\n"
++	"	lg	%r2,0xea0\n"
++	"	sllg	%r3,%r2,1\n"
++	"	sth	%r1,0xeb0(%r3)\n"
++	"	aghi	%r2,1\n"
++	"	stg	%r2,0xea0\n"
++	"	cghi	%r2,2\n"
++	"	jhe	1f\n"
++	"	lpswe	0x130\n"
++	"1:	diag	1,0,0x501\n"
++	"guest_end:\n"
++	"	.popsection\n");
++
++static struct kvm_vm *vm;
++static u8 *mem;
++
++static u64 gaddr(const char *label)
++{
++	return GUEST_CODE + (label - guest_start);
++}
++
++static u16 rd16(unsigned long addr)
++{
++	return be16toh(*(u16 *)(mem + addr));
++}
++
++static u32 rd32(unsigned long addr)
++{
++	return be32toh(*(u32 *)(mem + addr));
++}
++
++static u64 rd64(unsigned long addr)
++{
++	return be64toh(*(u64 *)(mem + addr));
++}
++
++static void wr64(unsigned long addr, u64 val)
++{
++	*(u64 *)(mem + addr) = htobe64(val);
++}
++
++static void wr_psw(unsigned long addr, u64 mask, u64 ia)
++{
++	wr64(addr, mask);
++	wr64(addr + 8, ia);
++}
++
++static void setup_lowcore(const char *ext_handler)
++{
++	memset(mem, 0, 2 * getpagesize());
++	wr_psw(LC_RST_NEW, PSW_MASK_64, gaddr(s_other));
++	wr_psw(LC_EXT_NEW, PSW_MASK_64, gaddr(ext_handler));
++	wr_psw(LC_SVC_NEW, PSW_MASK_64, gaddr(s_other));
++	wr_psw(LC_PGM_NEW, PSW_MASK_64, gaddr(s_pgm));
++	wr_psw(LC_MCK_NEW, PSW_MASK_64, gaddr(s_other));
++	wr_psw(LC_IO_NEW, PSW_MASK_64, gaddr(s_other));
++	wr64(D_CR0, CR0_RESET | CR0_IUCV);
++	wr64(D_CR0_EMERG, CR0_RESET | CR0_IUCV | CR0_EMERGENCY);
++	wr_psw(D_PSW_WAIT, PSW_MASK_64 | PSW_MASK_EXT | PSW_MASK_WAIT, 0);
++}
++
++static void start_at(struct kvm_vcpu *vcpu, const char *label, u64 mask)
++{
++	vcpu->run->psw_mask = PSW_MASK_64 | mask;
++	vcpu->run->psw_addr = gaddr(label);
++}
++
++static bool is_diag_exit(struct kvm_run *run)
++{
++	return run->exit_reason == KVM_EXIT_S390_SIEIC &&
++	       run->s390_sieic.icptcode == ICPT_INST &&
++	       (run->s390_sieic.ipa & 0xff0f) == 0x8300 &&
++	       run->s390_sieic.ipb == 0x05010000;
++}
++
++/* run until the guest leaves through DIAGNOSE 0x501, return its number */
++static int run_to_exit(struct kvm_vcpu *vcpu)
++{
++	struct kvm_run *run = vcpu->run;
++
++	vcpu_run(vcpu);
++	TEST_ASSERT(is_diag_exit(run),
++		    "exit %u icpt 0x%02x ipa 0x%04x ipb 0x%08x psw 0x%016llx 0x%016llx",
++		    run->exit_reason, run->s390_sieic.icptcode,
++		    run->s390_sieic.ipa, run->s390_sieic.ipb,
++		    run->psw_mask, run->psw_addr);
++	return (run->s390_sieic.ipa >> 4) & 0xf;
++}
++
++/* run with the interrupt window requested; true if it opened */
++static bool run_to_window(struct kvm_vcpu *vcpu)
++{
++	struct kvm_run *run = vcpu->run;
++
++	run->request_interrupt_window = 1;
++	vcpu_run(vcpu);
++	run->request_interrupt_window = 0;
++	TEST_ASSERT(run->exit_reason == KVM_EXIT_IRQ_WINDOW_OPEN ||
++		    is_diag_exit(run),
++		    "exit %u psw 0x%016llx 0x%016llx", run->exit_reason,
++		    run->psw_mask, run->psw_addr);
++	return run->exit_reason == KVM_EXIT_IRQ_WINDOW_OPEN &&
++	       run->ready_for_interrupt_injection;
++}
++
++static int inject(struct kvm_vcpu *vcpu, u64 subclass, u16 code, u32 flags)
++{
++	struct kvm_s390_irq irq = {
++		.type = KVM_S390_INT_EXT_USER,
++		.u.ext_user = {
++			.subclass = subclass,
++			.code = code,
++			.cpu_addr = 0x0001,
++			.params = 0x12345678,
++			.params2 = 0x1122334455667788ULL,
++			.flags = flags,
++		},
++	};
++
++	return __vcpu_ioctl(vcpu, KVM_S390_IRQ, &irq) ? -errno : 0;
++}
++
++static int inject_iucv(struct kvm_vcpu *vcpu)
++{
++	return inject(vcpu, CR0_IUCV, EXT_IUCV, KVM_S390_EXT_USER_CPU_ADDR |
++		      KVM_S390_EXT_USER_PARAMS | KVM_S390_EXT_USER_PARAMS2);
++}
++
++static void test_interface(void)
++{
++	struct kvm_vcpu *vcpu;
++	struct kvm_vm *v;
++	bool ok;
++
++	v = vm_create_barebones();
++	vcpu = __vm_vcpu_add(v, 0);
++	ok = inject(vcpu, CR0_IUCV, EXT_IUCV, 0) == -EINVAL;
++	ok &= __vm_enable_cap(v, KVM_CAP_S390_USER_EXT_IRQ, 0) == -1 &&
++	      errno == EINVAL;
++	ok &= !__vm_enable_cap(v, KVM_CAP_S390_USER_EXT_IRQ, CR0_IUCV);
++	/* the subclass must be one user space announced */
++	ok &= inject(vcpu, CR0_EMERGENCY, EXT_IUCV, 0) == -EINVAL;
++	ok &= inject(vcpu, 0, EXT_IUCV, 0) == -EINVAL;
++	ok &= inject(vcpu, CR0_IUCV, EXT_IUCV, 0x80) == -EINVAL;
++	ok &= inject(vcpu, CR0_IUCV, EXT_IUCV, 0) == 0;
++	ok &= inject(vcpu, CR0_IUCV, EXT_IUCV, 0) == -EBUSY;
++	kvm_vm_free(v);
++	ksft_test_result(ok, "capability and injection parameters are checked\n");
++}
++
++/* the window opens only once LOAD CONTROL enables the subclass */
++static void test_window_lctl(struct kvm_vcpu *vcpu)
++{
++	struct kvm_run *run = vcpu->run;
++	bool open;
++
++	setup_lowcore(s_ext);
++	start_at(vcpu, g_lctl, PSW_MASK_EXT);
++	open = run_to_window(vcpu);
++	ksft_test_result(open && run->psw_addr == gaddr(g_lctl_done),
++			 "window opens after LOAD CONTROL (psw 0x%016llx 0x%016llx)\n",
++			 run->psw_mask, run->psw_addr);
++}
++
++/* injected at the window, the interruption is presented at once */
++static void test_delivery(struct kvm_vcpu *vcpu)
++{
++	struct kvm_run *run = vcpu->run;
++	int rc, n;
++
++	rc = inject_iucv(vcpu);
++	TEST_ASSERT_EQ(rc, 0);
++	n = run_to_exit(vcpu);
++	ksft_test_result(n == EXIT_EXT && rd16(LC_EXT_CODE) == EXT_IUCV &&
++			 rd16(LC_EXT_CPU_ADDR) == 1 &&
++			 rd32(LC_EXT_PARAMS) == 0x12345678 &&
++			 rd64(LC_EXT_PARAMS2) == 0x1122334455667788ULL &&
++			 rd64(LC_EXT_OLD) == (PSW_MASK_64 | PSW_MASK_EXT) &&
++			 rd64(LC_EXT_OLD + 8) == gaddr(g_lctl_done) &&
++			 !run->ready_for_interrupt_injection,
++			 "presented with code, CPU address, parameters (exit %d, code 0x%04x, old PSW 0x%016lx 0x%016lx, ready %u)\n",
++			 n, rd16(LC_EXT_CODE), rd64(LC_EXT_OLD),
++			 rd64(LC_EXT_OLD + 8), run->ready_for_interrupt_injection);
++}
++
++/* the window opens only once the PSW enables external interruptions */
++static void test_window_psw(struct kvm_vcpu *vcpu)
++{
++	struct kvm_run *run = vcpu->run;
++	bool open;
++	int n;
++
++	setup_lowcore(s_ext);
++	start_at(vcpu, g_stosm, 0);
++	open = run_to_window(vcpu);
++	ksft_test_result(open && run->psw_addr == gaddr(g_stosm_done) &&
++			 (run->psw_mask & PSW_MASK_EXT),
++			 "window opens after STORE THEN OR SYSTEM MASK (psw 0x%016llx 0x%016llx)\n",
++			 run->psw_mask, run->psw_addr);
++	/* flags: nothing but the code is stored */
++	wr64(LC_EXT_PARAMS, 0xffffffffffffffffULL);
++	TEST_ASSERT_EQ(inject(vcpu, CR0_IUCV, EXT_IUCV, 0), 0);
++	n = run_to_exit(vcpu);
++	ksft_test_result(n == EXIT_EXT && rd16(LC_EXT_CODE) == EXT_IUCV &&
++			 rd32(LC_EXT_PARAMS) == 0xffffffff &&
++			 rd16(LC_EXT_CPU_ADDR) == 0xffff && !rd64(LC_EXT_PARAMS2),
++			 "without flags only the code is stored (exit %d, 0x80: %016lx)\n",
++			 n, rd64(LC_EXT_PARAMS));
++}
++
++/* an enabled wait ends with the window exit */
++static void test_window_wait(struct kvm_vcpu *vcpu)
++{
++	struct kvm_run *run = vcpu->run;
++	bool open;
++	int n;
++
++	setup_lowcore(s_ext);
++	start_at(vcpu, g_wait, 0);
++	open = run_to_window(vcpu);
++	ksft_test_result(open && (run->psw_mask & PSW_MASK_WAIT),
++			 "window opens in the enabled wait (psw 0x%016llx 0x%016llx)\n",
++			 run->psw_mask, run->psw_addr);
++	TEST_ASSERT_EQ(inject_iucv(vcpu), 0);
++	n = run_to_exit(vcpu);
++	ksft_test_result(n == EXIT_EXT && rd16(LC_EXT_CODE) == EXT_IUCV &&
++			 (rd64(LC_EXT_OLD) & PSW_MASK_WAIT),
++			 "presented to the waiting vCPU (exit %d, old PSW 0x%016lx)\n",
++			 n, rd64(LC_EXT_OLD));
++}
++
++/*
++ * A pending interruption waits until the vCPU is enabled, is included in
++ * the interrupt state and comes back with it, and has lower priority than
++ * an emergency signal.
++ */
++static void test_pending(struct kvm_vcpu *vcpu)
++{
++	struct kvm_s390_irq irqs[8] = {};
++	struct kvm_s390_irq_state state = {
++		.buf = (u64)irqs,
++		.len = sizeof(irqs),
++	};
++	struct kvm_s390_irq emerg = {
++		.type = KVM_S390_INT_EMERGENCY,
++		.u.emerg.code = 0,
++	};
++	struct kvm_run *run = vcpu->run;
++	int i, len, n, found = -1;
++	bool ok;
++
++	setup_lowcore(s_multi);
++	start_at(vcpu, g_disabled, 0);
++	n = run_to_exit(vcpu);
++	TEST_ASSERT_EQ(n, EXIT_DONE);
++	TEST_ASSERT_EQ(inject_iucv(vcpu), 0);
++	ok = inject_iucv(vcpu) == -EBUSY && !run->ready_for_interrupt_injection;
++
++	len = __vcpu_ioctl(vcpu, KVM_S390_GET_IRQ_STATE, &state);
++	for (i = 0; len > 0 && i < len / (int)sizeof(irqs[0]); i++)
++		if (irqs[i].type == KVM_S390_INT_EXT_USER)
++			found = i;
++	ok &= found >= 0 && irqs[found].u.ext_user.code == EXT_IUCV &&
++	      irqs[found].u.ext_user.subclass == CR0_IUCV &&
++	      irqs[found].u.ext_user.params == 0x12345678;
++	ksft_test_result(ok,
++			 "pending interruption: second injection refused, in the interrupt state (%d bytes)\n",
++			 len);
++
++	/* the normal reset clears it, setting the state brings it back */
++	vcpu_ioctl(vcpu, KVM_S390_NORMAL_RESET, NULL);
++	state.len = len;
++	ok = len > 0 && !__vcpu_ioctl(vcpu, KVM_S390_SET_IRQ_STATE, &state);
++	vcpu_ioctl(vcpu, KVM_S390_IRQ, &emerg);
++
++	wr64(D_COUNT, 0);
++	start_at(vcpu, g_enable, 0);
++	n = run_to_exit(vcpu);
++	ksft_test_result(ok && n == EXIT_EXT && rd64(D_COUNT) == 2 &&
++			 rd16(D_CODES) == EXT_EMERGENCY &&
++			 rd16(D_CODES + 2) == EXT_IUCV,
++			 "restored with the interrupt state, presented after an emergency signal (exit %d, codes 0x%04x 0x%04x)\n",
++			 n, rd16(D_CODES), rd16(D_CODES + 2));
++}
++
++static void test_esa390(void)
++{
++	struct kvm_vcpu *vcpu;
++	struct kvm_run *run;
++	u32 mode = KVM_S390_ARCH_MODE_ESA390_CM;
++	bool open;
++	int n;
++
++	if (!kvm_has_cap(KVM_CAP_S390_ESA390_CM)) {
++		ksft_test_result_skip("no ESA/390-compatibility mode\n");
++		ksft_test_result_skip("no ESA/390-compatibility mode\n");
++		return;
++	}
++
++	vm = vm_create_barebones();
++	vm_enable_cap(vm, KVM_CAP_S390_USER_SIGP, 0);
++	vm_enable_cap(vm, KVM_CAP_S390_ESA390_CM, 0);
++	vm_enable_cap(vm, KVM_CAP_S390_USER_EXT_IRQ, CR0_IUCV);
++	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS, 0, 0,
++				    GUEST_MEM_PAGES, 0);
++	mem = addr_gpa2hva(vm, 0);
++	memcpy(mem + GUEST_CODE, guest_start, guest_end - guest_start);
++	kvm_device_attr_set(vm->fd, KVM_S390_VM_ARCH_MODE,
++			    KVM_S390_VM_ARCH_MODE_CURRENT, &mode);
++	vcpu = __vm_vcpu_add(vm, 0);
++	run = vcpu->run;
++
++	memset(mem, 0, 2 * getpagesize());
++	*(u32 *)(mem + ESA_EXT_NEW) = htobe32(ESA_PSW_BIT12);
++	*(u32 *)(mem + ESA_EXT_NEW + 4) = htobe32(ESA_PSW_AMODE31 | gaddr(s_ext));
++	*(u32 *)(mem + D_CR0 + 4) = htobe32((u32)(CR0_RESET | CR0_IUCV));
++	*(u32 *)(mem + D_PSW_WAIT + 8) =
++		htobe32(ESA_PSW_EXT | ESA_PSW_WAIT | ESA_PSW_BIT12);
++	*(u32 *)(mem + D_PSW_WAIT + 12) = htobe32(ESA_PSW_AMODE31);
++	run->psw_mask = 0x0000000080000000ULL;
++	run->psw_addr = gaddr(g_esa);
++
++	/* a host that cannot run the mode refuses the first entry */
++	run->request_interrupt_window = 1;
++	if (__vcpu_run(vcpu) < 0 && errno == EINVAL) {
++		kvm_vm_free(vm);
++		ksft_test_result_skip("the host does not run ESA/390-format state descriptions\n");
++		ksft_test_result_skip("the host does not run ESA/390-format state descriptions\n");
++		return;
++	}
++	run->request_interrupt_window = 0;
++	open = run->exit_reason == KVM_EXIT_IRQ_WINDOW_OPEN &&
++	       run->ready_for_interrupt_injection;
++	ksft_test_result(open,
++			 "ESA/390: window opens in the enabled wait (exit %u, psw 0x%016llx 0x%016llx)\n",
++			 run->exit_reason, run->psw_mask, run->psw_addr);
++
++	TEST_ASSERT_EQ(inject_iucv(vcpu), 0);
++	n = run_to_exit(vcpu);
++	ksft_test_result(n == EXIT_EXT && rd16(LC_EXT_CODE) == EXT_IUCV &&
++			 rd32(LC_EXT_PARAMS) == 0x12345678 &&
++			 rd32(ESA_EXT_OLD) == (ESA_PSW_EXT | ESA_PSW_WAIT | ESA_PSW_BIT12) &&
++			 !rd64(LC_EXT_OLD) && !rd64(LC_EXT_PARAMS2),
++			 "ESA/390: presented with an eight-byte old PSW, no second parameter (exit %d, old PSW 0x%016lx)\n",
++			 n, rd64(ESA_EXT_OLD));
++	kvm_vm_free(vm);
++}
++
++int main(int argc, char *argv[])
++{
++	struct kvm_vcpu *vcpu;
++
++	TEST_REQUIRE(kvm_has_cap(KVM_CAP_S390_USER_EXT_IRQ));
++
++	ksft_print_header();
++	ksft_set_plan(11);
++
++	test_interface();
++
++	vm = vm_create_barebones();
++	vm_enable_cap(vm, KVM_CAP_S390_USER_EXT_IRQ, CR0_IUCV);
++	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS, 0, 0,
++				    GUEST_MEM_PAGES, 0);
++	mem = addr_gpa2hva(vm, 0);
++	memcpy(mem + GUEST_CODE, guest_start, guest_end - guest_start);
++	vcpu = __vm_vcpu_add(vm, 0);
++
++	test_window_lctl(vcpu);
++	test_delivery(vcpu);
++	test_window_psw(vcpu);
++	test_window_wait(vcpu);
++	test_pending(vcpu);
++	kvm_vm_free(vm);
++
++	test_esa390();
++
++	ksft_finished();
++}
+-- 
+2.47.3
+

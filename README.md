@@ -141,3 +141,10 @@ in the upstream tree) and `config/config-s390x.opts`, which
 The packages do not touch the boot configuration. On IBM Z the boot record is written by `zipl`;
 the kernel hooks of `s390-tools` and of `proxmox-kernel-helper` run it when a kernel is installed
 or removed.
+
+## Incremental builds
+
+`7.3.6-1+s390x7` is an interim exception: its binary packages were built incrementally in the
+build tree of `7.3.6-1+s390x6` (changed patches reverse-applied and applied, only the changed
+objects rebuilt). The source package is the normal `make dsc` output. The next version is to be a
+clean `make deb` build again.
