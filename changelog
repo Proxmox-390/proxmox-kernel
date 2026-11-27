@@ -1,3 +1,10 @@
+proxmox-kernel-7.3 (7.3.6-1+s390x8) trixie; urgency=medium
+
+  * clean rebuild of 7.3.6-1+s390x7 (built from scratch instead of
+    incrementally), no functional change.
+
+ -- Yvan Janssens <yvanj@cyber.gent>  Fri, 27 Nov 2026 09:55:56 +0000
+
 proxmox-kernel-7.3 (7.3.6-1+s390x7) trixie; urgency=medium
 
   * KVM: s390: ESA/390 DAT shadowing: purge the guest TLB when the vCPU

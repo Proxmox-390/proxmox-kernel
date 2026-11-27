@@ -144,7 +144,7 @@ or removed.
 
 ## Incremental builds
 
-`7.3.6-1+s390x7` is an interim exception: its binary packages were built incrementally in the
+`7.3.6-1+s390x7` was an interim exception: its binary packages were built incrementally in the
 build tree of `7.3.6-1+s390x6` (changed patches reverse-applied and applied, only the changed
-objects rebuilt). The source package is the normal `make dsc` output. The next version is to be a
-clean `make deb` build again.
+objects rebuilt). The source package was the normal `make dsc` output. `7.3.6-1+s390x8` is the
+same source built again from scratch (`make deb` in a fresh tree) and replaces it.
